@@ -73,6 +73,16 @@ with st.form("swap_inputs"):
             help="Applied to the far leg only, always against the client.",
         )
 
+    pair_obj_form = get_pair(pair_code)
+    notional_base = st.number_input(
+        f"Trade amount (in {pair_obj_form.base}, base ccy)",
+        value=1_000_000.0,
+        min_value=0.0,
+        step=100_000.0,
+        format="%.2f",
+        help="Notional traded, expressed in the base currency by FX convention.",
+    )
+
     submitted = st.form_submit_button("Compute", width="stretch")
 
 if submitted:
@@ -85,6 +95,7 @@ if submitted:
             spot=spot,
             forward_points=forward_points,
             spread_pct=spread_pct,
+            notional_base=notional_base,
         )
     except (ValueError, KeyError) as e:
         st.error(str(e))
@@ -113,6 +124,27 @@ if submitted:
         delta=fmt_pct(result.rate_difference),
         delta_color="inverse",
     )
+
+    if result.notional_base > 0:
+        st.subheader("Cashflows")
+        c1, c2, c3 = st.columns(3)
+        c1.metric(
+            f"Near leg ({pair_obj.quote})",
+            fmt_money(result.near_leg_quote, 2),
+            help=f"Notional × Spot, settled on {result.near_date}.",
+        )
+        c2.metric(
+            f"Far leg mid ({pair_obj.quote})",
+            fmt_money(result.far_leg_quote_mid, 2),
+            help=f"Notional × Forward mid, settled on {result.far_date}.",
+        )
+        c3.metric(
+            f"Far leg client ({pair_obj.quote})",
+            fmt_money(result.far_leg_quote_client, 2),
+            delta=fmt_money(result.spread_pnl_quote, 2),
+            delta_color="inverse",
+            help="Delta = spread P&L paid by the client, in quote ccy.",
+        )
 
     with st.expander("Details and formulas"):
         st.markdown(

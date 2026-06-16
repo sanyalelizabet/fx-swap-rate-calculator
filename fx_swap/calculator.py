@@ -38,6 +38,11 @@ class SwapResult:
     forward_client: float
     rate_client: float       # annualised, decimal
     rate_difference: float   # rate_client - rate_mid, decimal
+    notional_base: float           # trade amount in base ccy
+    near_leg_quote: float          # near-leg counter-amount in quote ccy (notional * spot)
+    far_leg_quote_mid: float       # far-leg counter-amount, mid (notional * F_mid)
+    far_leg_quote_client: float    # far-leg counter-amount, client (notional * F_client)
+    spread_pnl_quote: float        # client cost from spread, in quote ccy
 
 
 def compute_swap(
@@ -48,6 +53,7 @@ def compute_swap(
     spot: float,
     forward_points: float,
     spread_pct: float,
+    notional_base: float = 0.0,
 ) -> SwapResult:
     if isinstance(pair, str):
         pair = get_pair(pair)
@@ -58,6 +64,8 @@ def compute_swap(
         raise ValueError("far_date must be strictly after near_date")
     if spot <= 0:
         raise ValueError("spot must be positive")
+    if notional_base < 0:
+        raise ValueError("notional_base must be non-negative")
 
     days = (far_date - near_date).days
     forward_mid = spot + forward_points / pair.pip_factor
@@ -66,6 +74,11 @@ def compute_swap(
     sign = 1.0 if side == "BUY" else -1.0
     forward_client = forward_mid * (1.0 + sign * spread_pct / 100.0)
     rate_client = (forward_client - spot) / spot * 360.0 / days
+
+    near_leg_quote = notional_base * spot
+    far_leg_quote_mid = notional_base * forward_mid
+    far_leg_quote_client = notional_base * forward_client
+    spread_pnl_quote = far_leg_quote_client - far_leg_quote_mid
 
     return SwapResult(
         pair=pair.code,
@@ -82,4 +95,9 @@ def compute_swap(
         forward_client=forward_client,
         rate_client=rate_client,
         rate_difference=rate_client - rate_mid,
+        notional_base=notional_base,
+        near_leg_quote=near_leg_quote,
+        far_leg_quote_mid=far_leg_quote_mid,
+        far_leg_quote_client=far_leg_quote_client,
+        spread_pnl_quote=spread_pnl_quote,
     )

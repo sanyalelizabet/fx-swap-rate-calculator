@@ -40,6 +40,18 @@ def test_far_must_be_after_near():
         compute_swap("EURUSD", "BUY", date(2026, 4, 1), date(2026, 1, 1), 1.0850, 50.0, 0.0)
 
 
+def test_notional_cashflows():
+    r = compute_swap(
+        "EURUSD", "BUY", date(2026, 1, 1), date(2026, 4, 1),
+        1.0850, 50.0, 0.10, notional_base=1_000_000.0,
+    )
+    assert r.near_leg_quote == pytest.approx(1_000_000 * 1.0850)
+    assert r.far_leg_quote_mid == pytest.approx(1_000_000 * r.forward_mid)
+    assert r.far_leg_quote_client == pytest.approx(1_000_000 * r.forward_client)
+    # Spread against a BUY client raises the far leg -> client pays more quote ccy.
+    assert r.spread_pnl_quote > 0
+
+
 def test_unknown_pair():
     with pytest.raises(KeyError):
         compute_swap("XYZABC", "BUY", date(2026, 1, 1), date(2026, 4, 1), 1.0, 0.0, 0.0)

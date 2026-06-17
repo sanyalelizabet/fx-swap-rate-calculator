@@ -17,7 +17,11 @@ from fx_swap.pairs import PAIRS
 st.set_page_config(page_title="FX Swap Rate Calculator", layout="centered")
 
 st.title("FX Swap Rate Calculator")
-st.caption("ACT/360 day count. Forward points use market-standard pip factor (100 for JPY-quoted pairs, 10'000 otherwise).")
+st.caption(
+    "ACT/360 day count. Annualised rate is the carry to the client's side of "
+    "the swap, so SELLing a base ccy at forward discount returns a positive rate. "
+    "Spread always reduces the carry."
+)
 
 
 def fmt_money(x: float, dp: int = 4) -> str:
@@ -147,15 +151,18 @@ if submitted:
         )
 
     with st.expander("Details and formulas"):
+        side_sign_txt = "+" if result.side == "BUY" else "−"
+        cf_sign_txt = "+" if result.side == "BUY" else "−"
         st.markdown(
             f"""
 - **Pair**: {pair_obj.code}  (base = {pair_obj.base}, quote = {pair_obj.quote})
 - **Pip factor**: {int(result.pip_factor):,}
 - **Days**: ({result.far_date} − {result.near_date}) = **{result.days}**
 - **Forward mid**: `S + P/pip = {fmt_money(result.spot, 6)} + {fmt_money(result.forward_points, 4)} / {int(result.pip_factor)} = {fmt_money(result.forward_mid, 6)}`
-- **Annualised rate (mid)**: `(F − S)/S × 360/days = {fmt_pct(result.rate_mid)}`
-- **Client far leg**: `F × (1 {'+' if result.side == 'BUY' else '−'} s/100) = {fmt_money(result.forward_client, 6)}`
-- **Annualised rate (client)**: `{fmt_pct(result.rate_client)}`
-- **Spread cost in rate terms**: `{fmt_pct(result.rate_difference)}`
+- **Market swap rate** (objective, IR differential `r_quote − r_base`): `(F − S)/S × 360/days = {fmt_pct(result.market_swap_rate)}`
+- **Carry to client (mid)** = `{side_sign_txt}market_swap_rate` (sign-flipped on SELL) = `{fmt_pct(result.rate_mid)}`
+- **Client far leg** (cashflow): `F × (1 {cf_sign_txt} s/100) = {fmt_money(result.forward_client, 6)}`
+- **Spread cost** (always positive, always reduces carry): `|F_client − F_mid|/S × 360/days = {fmt_pct(result.spread_cost)}`
+- **Carry to client (post-spread)** = `rate_mid − spread_cost = {fmt_pct(result.rate_client)}`
             """
         )

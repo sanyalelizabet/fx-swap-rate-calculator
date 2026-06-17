@@ -181,8 +181,35 @@ if submitted:
         "actually quote — the difference is the spread."
     )
 
-    # ---- Spread P&L ----
-    st.subheader("Spread")
+    # ---- Annualised rates (ACT/360, market convention) ----
+    # Same formula at mid and at client forward; sign-symmetric in BUY/SELL.
+    # Negative = base ccy at forward discount (higher base ccy rate).
+    rate_mid = t.market_swap_rate
+    rate_client = (t.forward_client - t.spot) / t.spot * 360.0 / t.days
+    rate_spread = rate_client - rate_mid
+
+    st.subheader("Annualised rate (ACT/360)")
+    c1, c2, c3 = st.columns(3)
+    c1.metric(
+        "Mid",
+        fmt_pct(rate_mid),
+        help="(F_mid − S) / S × 360/days. Market swap rate = implied IR differential.",
+    )
+    c2.metric(
+        "Client",
+        fmt_pct(rate_client),
+        delta=fmt_pct(rate_spread),
+        delta_color="inverse",
+        help="(F_client − S) / S × 360/days. Delta vs mid = spread cost in rate terms.",
+    )
+    c3.metric(
+        "Spread cost (rate)",
+        fmt_pct(abs(rate_spread)),
+        help="Absolute difference between client and mid annualised rates.",
+    )
+
+    # ---- Spread P&L in quote ccy ----
+    st.subheader("Spread (quote ccy)")
     c1, c2 = st.columns(2)
     c1.metric(
         f"Bank revenue ({t.quote_ccy})",

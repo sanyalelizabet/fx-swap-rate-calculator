@@ -50,12 +50,14 @@ with st.form("ticket_inputs"):
             index=sorted(PAIRS.keys()).index("EURUSD"),
         )
     with col2:
-        side = st.radio(
-            "Side (on the base ccy forward)",
+        near_side = st.radio(
+            "Side (on the base ccy near leg)",
             options=["BUY", "SELL"],
             horizontal=True,
-            help="BUY = client buys the base ccy on the far date. Near leg is opposite.",
+            help="What you do on the near (spot) leg. Far leg is automatically the opposite.",
         )
+        # Calculator expects the far-leg side. Near leg is always opposite.
+        side = "SELL" if near_side == "BUY" else "BUY"
 
     pair_obj_form = get_pair(pair_code)
 
@@ -127,7 +129,7 @@ if submitted:
     st.subheader("Trade summary")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Pair", t.pair)
-    c2.metric("Side (base ccy)", t.side)
+    c2.metric(f"Near leg (base ccy)", near_side)
     c3.metric("Days (ACT)", t.days)
     c4.metric(
         f"Base notional ({t.base_ccy})",

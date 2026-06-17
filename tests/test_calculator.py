@@ -64,8 +64,40 @@ def test_sell_forward_cashflow_signs():
 def test_amount_in_quote_ccy_derives_base():
     # 1'085'000 USD in EURUSD spot 1.0850 -> base notional = 1'000'000 EUR.
     t = _ticket(amount=1_085_000.0, amount_ccy="QUOTE")
-    assert t.base_notional == pytest.approx(1_000_000.0)
+    assert t.near_base_notional == pytest.approx(1_000_000.0)
+    assert t.far_base_notional == pytest.approx(1_000_000.0)
+    assert t.is_matched is True
     assert abs(t.near_leg.quote_flow) == pytest.approx(1_085_000.0)
+
+
+def test_uneven_swap_separate_notionals():
+    # Near 1mio EUR, far 1.5mio EUR.
+    t = compute_ticket(
+        "EURUSD", "BUY", date(2026, 1, 1), date(2026, 4, 1),
+        1.0850, 50.0, 0.0,
+        amount=1_000_000.0, amount_ccy="BASE",
+        far_amount=1_500_000.0, far_amount_ccy="BASE",
+    )
+    assert t.near_base_notional == pytest.approx(1_000_000.0)
+    assert t.far_base_notional == pytest.approx(1_500_000.0)
+    assert t.is_matched is False
+    assert abs(t.near_leg.base_flow) == pytest.approx(1_000_000.0)
+    assert abs(t.far_leg_mid.base_flow) == pytest.approx(1_500_000.0)
+    assert abs(t.near_leg.quote_flow) == pytest.approx(1_000_000.0 * 1.0850)
+    assert abs(t.far_leg_mid.quote_flow) == pytest.approx(1_500_000.0 * t.forward_mid)
+
+
+def test_uneven_far_in_quote_ccy_uses_forward_rate():
+    # Far amount 1.09mio USD should derive a base notional of 1.09e6 / F_mid.
+    t = compute_ticket(
+        "EURUSD", "BUY", date(2026, 1, 1), date(2026, 4, 1),
+        1.0850, 50.0, 0.0,
+        amount=1_000_000.0, amount_ccy="BASE",
+        far_amount=1_090_000.0, far_amount_ccy="QUOTE",
+    )
+    expected_far_base = 1_090_000.0 / t.forward_mid
+    assert t.far_base_notional == pytest.approx(expected_far_base)
+    assert t.is_matched is False
 
 
 def test_buy_spread_makes_client_pay_more_quote():

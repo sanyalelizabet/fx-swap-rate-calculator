@@ -87,10 +87,16 @@ with st.form("ticket_inputs"):
             help="Applied to the far leg only, always against the client.",
         )
 
+    uneven = st.checkbox(
+        "Uneven swap (different notionals on near and far leg)",
+        value=False,
+        help="Leave off for a standard matched-base swap. Tick to enter near and far amounts independently.",
+    )
+
     col8, col9 = st.columns([2, 1])
     with col8:
         amount = st.number_input(
-            "Trade amount",
+            "Near-leg amount" if uneven else "Trade amount",
             value=1_000_000.0,
             min_value=0.0,
             step=100_000.0,
@@ -100,13 +106,35 @@ with st.form("ticket_inputs"):
         amount_ccy = st.selectbox(
             "Amount in",
             options=[pair_obj_form.base, pair_obj_form.quote],
-            help="Which currency the amount is expressed in. If quote, the base notional is derived from spot.",
+            help="Which currency the amount is expressed in. If quote, the base notional is derived from the leg's rate (spot for near, forward for far).",
         )
+
+    far_amount = None
+    far_amount_ccy = None
+    if uneven:
+        col10, col11 = st.columns([2, 1])
+        with col10:
+            far_amount = st.number_input(
+                "Far-leg amount",
+                value=1_000_000.0,
+                min_value=0.0,
+                step=100_000.0,
+                format="%.2f",
+            )
+        with col11:
+            far_amount_ccy = st.selectbox(
+                "Far amount in",
+                options=[pair_obj_form.base, pair_obj_form.quote],
+                key="far_amount_ccy",
+            )
 
     submitted = st.form_submit_button("Quote", width="stretch")
 
 if submitted:
     amount_ccy_key = "BASE" if amount_ccy == pair_obj_form.base else "QUOTE"
+    far_amount_ccy_key = None
+    if uneven and far_amount_ccy is not None:
+        far_amount_ccy_key = "BASE" if far_amount_ccy == pair_obj_form.base else "QUOTE"
     try:
         t = compute_ticket(
             pair=pair_code,
@@ -118,6 +146,8 @@ if submitted:
             spread_pct=spread_pct,
             amount=amount,
             amount_ccy=amount_ccy_key,
+            far_amount=far_amount if uneven else None,
+            far_amount_ccy=far_amount_ccy_key,
         )
     except (ValueError, KeyError) as e:
         st.error(str(e))
@@ -131,10 +161,16 @@ if submitted:
     c1.metric("Pair", t.pair)
     c2.metric(f"Near leg (base ccy)", near_side)
     c3.metric("Days (ACT)", t.days)
-    c4.metric(
-        f"Base notional ({t.base_ccy})",
-        fmt_money(t.base_notional, 2).lstrip("+"),
-    )
+    if t.is_matched:
+        c4.metric(
+            f"Base notional ({t.base_ccy})",
+            fmt_money(t.near_base_notional, 2).lstrip("+"),
+        )
+    else:
+        c4.metric(
+            f"Notional near / far ({t.base_ccy})",
+            f"{fmt_money(t.near_base_notional, 2).lstrip('+')} / {fmt_money(t.far_base_notional, 2).lstrip('+')}",
+        )
 
     # ---- Rates strip ----
     st.subheader("Rates")
@@ -237,6 +273,7 @@ if submitted:
 **Implied IR differential** (market swap rate, sign-symmetric):
 `(F_mid − S) / S × 360/days = {fmt_pct(t.market_swap_rate)}` — interpretable as `r_{t.quote_ccy.lower()} − r_{t.base_ccy.lower()}`.
 
-**Base notional**: `{fmt_money(t.base_notional, 2).lstrip('+')} {t.base_ccy}` ({"entered in " + t.base_ccy if amount_ccy_key == "BASE" else f"derived from {amount} {t.quote_ccy} / spot {fmt_rate(t.spot, 6)}"}).
+**Near base notional**: `{fmt_money(t.near_base_notional, 2).lstrip('+')} {t.base_ccy}`
+**Far  base notional**: `{fmt_money(t.far_base_notional, 2).lstrip('+')} {t.base_ccy}` {"(matched)" if t.is_matched else "(uneven)"}
             """
         )

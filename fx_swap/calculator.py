@@ -1,29 +1,25 @@
-"""FX swap math: forward rate, ACT/360 annualised carry rate, client spread.
+"""FX swap quoting ticket: cashflows on both legs in both currencies.
 
 Conventions
 -----------
 * Forward rate from spot and forward points (in pips):
       F = S + P / pip_factor
-* The annualised rate is expressed as the carry to the client's side of
-  the swap (ACT/360), so that a SELL of a base ccy that trades at forward
-  discount returns a positive number:
-      market swap rate     m = (F - S) / S * 360 / days       (= r_quote - r_base)
-      client carry (mid)   r_mid = side_sign * m
-                                where side_sign = +1 for BUY, -1 for SELL.
-  Rationale: a BUY-forward swap (sell base spot, buy base forward) leaves the
-  client holding the quote ccy over the period, so their carry = r_quote - r_base.
-  A SELL-forward swap leaves the client holding the base ccy, so their carry
-  = r_base - r_quote = -m. Sign therefore flips with side.
-* Client spread (in percent) is applied to the far leg only, always against
-  the client. The far-leg quote-ccy amount moves against the client:
+* The trade is a matched-notional FX swap: same base-currency notional on
+  both legs, exchanged in opposite directions. The "side" refers to the
+  far leg's base-currency direction:
+      BUY  forward = SELL base spot + BUY  base forward (sell/buy swap)
+      SELL forward = BUY  base spot + SELL base forward (buy/sell swap)
+* Cashflow sign convention (from the client's point of view):
+      +  -> client receives
+      -  -> client pays
+* Amount input can be in either ccy. If in quote ccy, the base notional is
+  derived from spot so the near-leg quote-ccy amount matches the input.
+* Spread is applied to the far leg only, always against the client:
       BUY  -> F_client = F_mid * (1 + s/100)   (client pays more quote ccy)
       SELL -> F_client = F_mid * (1 - s/100)   (client receives less quote ccy)
-  The spread cost as an annualised rate is always positive, and is subtracted
-  from the carry regardless of side (a bank spread can never make the carry
-  better for the client):
-      spread_cost = |F_client - F_mid| / S * 360 / days
-      r_client    = r_mid - spread_cost
-* days = (far_date - near_date) in calendar days, ACT/360 day count.
+* days = (far_date - near_date) in calendar days, ACT/360.
+* The annualised swap rate (F-S)/S * 360/days is the implied IR differential
+  r_quote - r_base. Reported as informational footer only.
 """
 
 from dataclasses import dataclass
@@ -33,34 +29,81 @@ from typing import Literal
 from .pairs import FXPair, get_pair
 
 Side = Literal["BUY", "SELL"]
+AmountCcy = Literal["BASE", "QUOTE"]
 
 
 @dataclass(frozen=True)
-class SwapResult:
+class Leg:
+    """One leg of the swap, from the client's perspective."""
+    value_date: date
+    fx_rate: float        # rate applied to this leg
+    base_flow: float      # signed: + receive, - pay
+    quote_flow: float     # signed: + receive, - pay
+
+
+@dataclass(frozen=True)
+class SwapTicket:
     pair: str
+    base_ccy: str
+    quote_ccy: str
     side: Side
-    near_date: date
-    far_date: date
     days: int
     spot: float
     forward_points: float
     pip_factor: float
-    spread_pct: float
     forward_mid: float
-    rate_mid: float          # client carry at mid, annualised, decimal (0.025 = 2.5%)
-    market_swap_rate: float  # objective (F-S)/S * 360/days, sign-symmetric in side
     forward_client: float
-    rate_client: float       # client carry after spread = rate_mid - spread_cost
-    spread_cost: float       # always >= 0, annualised, decimal
-    rate_difference: float   # rate_client - rate_mid = -spread_cost
-    notional_base: float           # trade amount in base ccy
-    near_leg_quote: float          # near-leg counter-amount in quote ccy (notional * spot)
-    far_leg_quote_mid: float       # far-leg counter-amount, mid (notional * F_mid)
-    far_leg_quote_client: float    # far-leg counter-amount, client (notional * F_client)
-    spread_pnl_quote: float        # client cost from spread, in quote ccy
+    spread_pct: float
+    base_notional: float
+
+    near_leg: Leg            # same regardless of spread (spot leg)
+    far_leg_mid: Leg         # at the mid forward
+    far_leg_client: Leg      # at the client forward
+
+    spread_cost_quote: float # bank revenue = -(client's cost), positive number
+    market_swap_rate: float  # (F_mid - S)/S * 360/days, informational
 
 
-def compute_swap(
+def _resolve_base_notional(amount: float, amount_ccy: AmountCcy, spot: float) -> float:
+    if amount < 0:
+        raise ValueError("amount must be non-negative")
+    if amount_ccy == "BASE":
+        return amount
+    if amount_ccy == "QUOTE":
+        return amount / spot
+    raise ValueError(f"amount_ccy must be BASE or QUOTE, got {amount_ccy!r}")
+
+
+def _build_legs(
+    side: Side,
+    base_notional: float,
+    spot: float,
+    forward: float,
+    near_date: date,
+    far_date: date,
+) -> tuple[Leg, Leg]:
+    """Return (near_leg, far_leg) with signed cashflows.
+
+    BUY forward = SELL spot + BUY forward
+        Near: -base, +base*spot (sell base, receive quote at spot)
+        Far : +base, -base*F   (buy base, pay quote at forward)
+
+    SELL forward = BUY spot + SELL forward
+        Near: +base, -base*spot
+        Far : -base, +base*F
+    """
+    if side == "BUY":
+        near_base, near_quote = -base_notional, +base_notional * spot
+        far_base, far_quote = +base_notional, -base_notional * forward
+    else:  # SELL
+        near_base, near_quote = +base_notional, -base_notional * spot
+        far_base, far_quote = -base_notional, +base_notional * forward
+    near = Leg(value_date=near_date, fx_rate=spot, base_flow=near_base, quote_flow=near_quote)
+    far = Leg(value_date=far_date, fx_rate=forward, base_flow=far_base, quote_flow=far_quote)
+    return near, far
+
+
+def compute_ticket(
     pair: str | FXPair,
     side: Side,
     near_date: date,
@@ -68,64 +111,54 @@ def compute_swap(
     spot: float,
     forward_points: float,
     spread_pct: float,
-    notional_base: float = 0.0,
-) -> SwapResult:
+    amount: float,
+    amount_ccy: AmountCcy = "BASE",
+) -> SwapTicket:
     if isinstance(pair, str):
         pair = get_pair(pair)
     side = side.upper()  # type: ignore[assignment]
     if side not in ("BUY", "SELL"):
         raise ValueError(f"side must be BUY or SELL, got {side!r}")
+    amount_ccy = amount_ccy.upper()  # type: ignore[assignment]
     if far_date <= near_date:
         raise ValueError("far_date must be strictly after near_date")
     if spot <= 0:
         raise ValueError("spot must be positive")
-    if notional_base < 0:
-        raise ValueError("notional_base must be non-negative")
 
     days = (far_date - near_date).days
     forward_mid = spot + forward_points / pair.pip_factor
 
-    # Market swap rate = implied IR differential (r_quote - r_base), sign-symmetric.
-    market_swap_rate = (forward_mid - spot) / spot * 360.0 / days
-
-    # Client carry = market rate flipped by side so SELL of a base ccy trading
-    # at forward discount returns a positive carry (client holds the higher-yield ccy).
-    side_sign = 1.0 if side == "BUY" else -1.0
-    rate_mid = side_sign * market_swap_rate
-
-    # Cashflow far leg moves against the client (BUY pays more, SELL receives less).
     cf_sign = 1.0 if side == "BUY" else -1.0
     forward_client = forward_mid * (1.0 + cf_sign * spread_pct / 100.0)
 
-    # Spread cost in rate terms is always positive and always reduces the client's carry.
-    spread_cost = abs(forward_client - forward_mid) / spot * 360.0 / days
-    rate_client = rate_mid - spread_cost
+    base_notional = _resolve_base_notional(amount, amount_ccy, spot)
 
-    near_leg_quote = notional_base * spot
-    far_leg_quote_mid = notional_base * forward_mid
-    far_leg_quote_client = notional_base * forward_client
-    spread_pnl_quote = far_leg_quote_client - far_leg_quote_mid
+    near_leg, far_leg_mid = _build_legs(side, base_notional, spot, forward_mid, near_date, far_date)
+    _, far_leg_client = _build_legs(side, base_notional, spot, forward_client, near_date, far_date)
 
-    return SwapResult(
+    # Spread cost = how much more quote ccy the client pays (or less receives) vs mid.
+    # The signed difference of far-leg quote_flow points away from the client when worse.
+    # Absolute value gives the bank's revenue in quote ccy.
+    spread_cost_quote = abs(far_leg_client.quote_flow - far_leg_mid.quote_flow)
+
+    market_swap_rate = (forward_mid - spot) / spot * 360.0 / days
+
+    return SwapTicket(
         pair=pair.code,
+        base_ccy=pair.base,
+        quote_ccy=pair.quote,
         side=side,  # type: ignore[arg-type]
-        near_date=near_date,
-        far_date=far_date,
         days=days,
         spot=spot,
         forward_points=forward_points,
         pip_factor=pair.pip_factor,
-        spread_pct=spread_pct,
         forward_mid=forward_mid,
-        rate_mid=rate_mid,
-        market_swap_rate=market_swap_rate,
         forward_client=forward_client,
-        rate_client=rate_client,
-        spread_cost=spread_cost,
-        rate_difference=rate_client - rate_mid,
-        notional_base=notional_base,
-        near_leg_quote=near_leg_quote,
-        far_leg_quote_mid=far_leg_quote_mid,
-        far_leg_quote_client=far_leg_quote_client,
-        spread_pnl_quote=spread_pnl_quote,
+        spread_pct=spread_pct,
+        base_notional=base_notional,
+        near_leg=near_leg,
+        far_leg_mid=far_leg_mid,
+        far_leg_client=far_leg_client,
+        spread_cost_quote=spread_cost_quote,
+        market_swap_rate=market_swap_rate,
     )

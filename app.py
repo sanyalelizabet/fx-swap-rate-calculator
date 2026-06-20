@@ -76,11 +76,33 @@ with st.form("ticket_inputs"):
     with col5:
         spot = st.number_input("Spot rate", value=1.0850, format="%.6f", min_value=0.0)
     with col6:
+        # Direction of pip changes on the client's annualised carry depends
+        # on the near-leg side. Carry = ± (F - S)/S × 360/days, sign chosen
+        # so the ccy the client HOLDS over the period yields positive carry.
+        # near BUY base  -> holds base  -> carry sign is negative on (F-S),
+        #                  so MORE pips (higher F) -> LOWER carry to client.
+        # near SELL base -> holds quote -> carry sign is positive on (F-S),
+        #                  so MORE pips (higher F) -> HIGHER carry to client.
+        if near_side == "BUY":
+            pip_tip = (
+                "**Tip (you BUY base on near):** more pips → **lower** carry "
+                "rate to the client (you pay more in CHF/quote-ccy carry). "
+                "Fewer pips → higher carry."
+            )
+        else:
+            pip_tip = (
+                "**Tip (you SELL base on near):** more pips → **higher** carry "
+                "rate to the client (you earn more). "
+                "Fewer pips → lower carry."
+            )
         forward_points = st.number_input(
             "Forward points (pips)",
             value=50.0,
             format="%.4f",
-            help="Sign matters. Positive = base ccy at premium forward.",
+            help=(
+                "Sign matters. Positive = base ccy at premium forward.\n\n"
+                + pip_tip
+            ),
         )
     with col7:
         spread_pct = st.number_input(
@@ -167,7 +189,7 @@ if submitted:
 
     # ---- Rates strip ----
     st.subheader("Rates")
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     c1.metric("Spot", fmt_rate(t.spot, 6))
     c2.metric("Forward mid", fmt_rate(t.forward_mid, 6))
     c3.metric(
@@ -176,7 +198,20 @@ if submitted:
         delta=fmt_rate(t.forward_client - t.forward_mid, 6),
         delta_color="inverse",
     )
+
+    # Forward points: mid (user input echo) vs client (with spread applied).
+    fwd_points_client = (t.forward_client - t.spot) * t.pip_factor
+    fwd_points_spread = fwd_points_client - t.forward_points
+    c4, c5 = st.columns(2)
     c4.metric("Forward points (mid)", fmt_rate(t.forward_points, 4))
+    c5.metric(
+        "Forward points (client)",
+        fmt_rate(fwd_points_client, 4),
+        delta=fmt_rate(fwd_points_spread, 4),
+        delta_color="inverse",
+        help="Forward points with the client spread baked in: "
+             "(F_client − S) × pip_factor. Delta vs mid = the spread in pips.",
+    )
 
     # ---- Cashflows table ----
     st.subheader("Cashflows (from the client's perspective)")

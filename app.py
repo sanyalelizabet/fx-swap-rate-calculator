@@ -41,25 +41,24 @@ def fmt_pct(x: float, dp: int = 4) -> str:
     return f"{x * 100:.{dp}f}%"
 
 
-with st.form("ticket_inputs"):
-    col1, col2 = st.columns(2)
-    with col1:
-        pair_code = st.selectbox(
-            "Currency pair",
-            options=sorted(PAIRS.keys()),
-            index=sorted(PAIRS.keys()).index("EURUSD"),
-        )
-    with col2:
-        near_side = st.radio(
-            "Side (on the base ccy near leg)",
-            options=["BUY", "SELL"],
-            horizontal=True,
-            help="What you do on the near (spot) leg. Far leg is automatically the opposite.",
-        )
-        # Calculator expects the far-leg side. Near leg is always opposite.
-        side = "SELL" if near_side == "BUY" else "BUY"
+# Pair is outside the form so changing it triggers a rerun and refreshes the
+# amount-ccy dropdown options (Streamlit forms suppress reruns until submit).
+pair_code = st.selectbox(
+    "Currency pair",
+    options=sorted(PAIRS.keys()),
+    index=sorted(PAIRS.keys()).index("EURUSD"),
+)
+pair_obj_form = get_pair(pair_code)
 
-    pair_obj_form = get_pair(pair_code)
+with st.form("ticket_inputs"):
+    near_side = st.radio(
+        "Side (on the base ccy near leg)",
+        options=["BUY", "SELL"],
+        horizontal=True,
+        help="What you do on the near (spot) leg. Far leg is automatically the opposite.",
+    )
+    # Calculator expects the far-leg side. Near leg is always opposite.
+    side = "SELL" if near_side == "BUY" else "BUY"
 
     col3, col4 = st.columns(2)
     today = date.today()

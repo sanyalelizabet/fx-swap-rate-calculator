@@ -55,15 +55,19 @@ except ValueError as e:
     st.error(str(e))
     st.stop()
 
+# Side lives outside the form so that changing it triggers a rerun and the
+# side-dependent help text on Forward points refreshes (Streamlit forms
+# suppress reruns until submit).
+near_side = st.radio(
+    "Side (on the base ccy near leg)",
+    options=["BUY", "SELL"],
+    horizontal=True,
+    help="What you do on the near (spot) leg. Far leg is automatically the opposite.",
+)
+# Calculator expects the far-leg side. Near leg is always opposite.
+side = "SELL" if near_side == "BUY" else "BUY"
+
 with st.form("ticket_inputs"):
-    near_side = st.radio(
-        "Side (on the base ccy near leg)",
-        options=["BUY", "SELL"],
-        horizontal=True,
-        help="What you do on the near (spot) leg. Far leg is automatically the opposite.",
-    )
-    # Calculator expects the far-leg side. Near leg is always opposite.
-    side = "SELL" if near_side == "BUY" else "BUY"
 
     col3, col4 = st.columns(2)
     today = date.today()

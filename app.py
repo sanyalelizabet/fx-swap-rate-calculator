@@ -218,31 +218,38 @@ if submitted:
         "actually quote — the difference is the spread."
     )
 
-    # ---- Annualised rates (ACT/360, market convention) ----
-    # Same formula at mid and at client forward; sign-symmetric in BUY/SELL.
-    # Negative = base ccy at forward discount (higher base ccy rate).
-    rate_mid = t.market_swap_rate
-    rate_client = (t.forward_client - t.spot) / t.spot * 360.0 / t.days
-    rate_spread = rate_client - rate_mid
+    # ---- Carry rate to the client's side (ACT/360) ----
+    # Sign convention: if the client BUYs base on near, they HOLD base over the
+    # period and earn r_base - r_quote = -market_swap_rate. If they SELL base on
+    # near, they hold quote and earn r_quote - r_base = +market_swap_rate.
+    # Spread always reduces carry (bank revenue, never a gift to the client).
+    carry_sign = +1.0 if near_side == "SELL" else -1.0
+    rate_mid_carry = carry_sign * t.market_swap_rate
+    # Spread cost in rate terms = magnitude of the F shift annualised, always >= 0.
+    spread_cost_rate = abs(t.forward_client - t.forward_mid) / t.spot * 360.0 / t.days
+    rate_client_carry = rate_mid_carry - spread_cost_rate
 
-    st.subheader("Annualised rate (ACT/360)")
+    held_ccy = t.base_ccy if near_side == "BUY" else t.quote_ccy
+    st.subheader(f"Carry rate (ACT/360) — you hold {held_ccy} over the period")
     c1, c2, c3 = st.columns(3)
     c1.metric(
         "Mid",
-        fmt_pct(rate_mid),
-        help="(F_mid − S) / S × 360/days. Market swap rate = implied IR differential.",
+        fmt_pct(rate_mid_carry),
+        help=f"Sign-flipped IR differential, expressed from your side. "
+             f"Positive = you earn carry, negative = you pay it. "
+             f"= {'+' if carry_sign > 0 else '−'} (F_mid − S)/S × 360/days.",
     )
     c2.metric(
         "Client",
-        fmt_pct(rate_client),
-        delta=fmt_pct(rate_spread),
+        fmt_pct(rate_client_carry),
+        delta=fmt_pct(-spread_cost_rate),
         delta_color="inverse",
-        help="(F_client − S) / S × 360/days. Delta vs mid = spread cost in rate terms.",
+        help="Mid carry minus the spread cost (always reduces carry, regardless of side).",
     )
     c3.metric(
         "Spread cost (rate)",
-        fmt_pct(abs(rate_spread)),
-        help="Absolute difference between client and mid annualised rates.",
+        fmt_pct(spread_cost_rate),
+        help="|F_client − F_mid| / S × 360/days. Always positive.",
     )
 
     # ---- Spread P&L in quote ccy ----
@@ -269,8 +276,10 @@ if submitted:
 
 **Forward client** (spread {('+ ' if t.side == 'BUY' else '− ')}{t.spread_pct:.4f}%): `F_mid × (1 {('+' if t.side == 'BUY' else '−')} s/100) = {fmt_rate(t.forward_client, 6)}`
 
-**Implied IR differential** (market swap rate, sign-symmetric):
-`(F_mid − S) / S × 360/days = {fmt_pct(t.market_swap_rate)}` — interpretable as `r_{t.quote_ccy.lower()} − r_{t.base_ccy.lower()}`.
+**Implied IR differential** (market swap rate, sign-symmetric — not shown above):
+`(F_mid − S) / S × 360/days = {fmt_pct(t.market_swap_rate)}` — interpretable as `r_{t.quote_ccy.lower()} − r_{t.base_ccy.lower()}`. This is a property of the market, not of your side.
+
+**Carry to your side** (shown above) = `±` IR differential, sign chosen so positive means you earn carry on the ccy you hold over the period. Spread cost is always subtracted.
 
 **Near base notional**: `{fmt_money(t.near_base_notional, 2).lstrip('+')} {t.base_ccy}`
 **Far  base notional**: `{fmt_money(t.far_base_notional, 2).lstrip('+')} {t.base_ccy}` {"(matched)" if t.is_matched else "(uneven)"}

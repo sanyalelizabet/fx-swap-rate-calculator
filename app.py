@@ -12,8 +12,7 @@ from datetime import date, timedelta
 import pandas as pd
 import streamlit as st
 
-from fx_swap import compute_ticket, get_pair, make_custom_pair
-from fx_swap.pairs import PAIRS
+from fx_swap import compute_ticket, make_custom_pair
 
 st.set_page_config(page_title="FX Swap Quoting Ticket", layout="centered")
 
@@ -41,33 +40,20 @@ def fmt_pct(x: float, dp: int = 4) -> str:
     return f"{x * 100:.{dp}f}%"
 
 
-# Pair is outside the form so changing it triggers a rerun and refreshes the
-# amount-ccy dropdown options (Streamlit forms suppress reruns until submit).
-use_custom_pair = st.checkbox(
-    "Custom pair (enter ccy codes manually)",
-    value=False,
-    help="For pairs not in the dropdown. Pip factor defaults to 100 for JPY-quoted, 10'000 otherwise.",
-)
+# Pair lives outside the form so changing the ccys triggers a rerun and the
+# amount-ccy dropdowns pick up the new base/quote (Streamlit forms suppress
+# reruns until submit).
+c_base, c_quote = st.columns(2)
+with c_base:
+    custom_base = st.text_input("Base ccy", value="EUR", max_chars=3).upper().strip()
+with c_quote:
+    custom_quote = st.text_input("Quote ccy", value="USD", max_chars=3).upper().strip()
 
-if use_custom_pair:
-    c_base, c_quote = st.columns(2)
-    with c_base:
-        custom_base = st.text_input("Base ccy", value="EUR", max_chars=3).upper().strip()
-    with c_quote:
-        custom_quote = st.text_input("Quote ccy", value="USD", max_chars=3).upper().strip()
-    try:
-        pair_obj_form = make_custom_pair(custom_base, custom_quote)
-    except ValueError as e:
-        st.error(str(e))
-        st.stop()
-    pair_code = pair_obj_form.code
-else:
-    pair_code = st.selectbox(
-        "Currency pair",
-        options=sorted(PAIRS.keys()),
-        index=sorted(PAIRS.keys()).index("EURUSD"),
-    )
-    pair_obj_form = get_pair(pair_code)
+try:
+    pair_obj_form = make_custom_pair(custom_base, custom_quote)
+except ValueError as e:
+    st.error(str(e))
+    st.stop()
 
 with st.form("ticket_inputs"):
     near_side = st.radio(
@@ -105,96 +91,56 @@ with st.form("ticket_inputs"):
             help="Applied to the far leg only, always against the client.",
         )
 
-    free_mode = st.checkbox(
-        "Uneven swap (set all four cashflows manually)",
-        value=False,
-        help="Leave off for a standard matched-base swap. Tick to enter the four leg "
-             "amounts as magnitudes; the implied rate per leg can differ from spot/forward.",
-    )
+    st.markdown("**Amounts** — one per leg, each in BASE or QUOTE ccy.")
+    c_na, c_nc = st.columns([2, 1])
+    with c_na:
+        near_amount = st.number_input(
+            "Near-leg amount",
+            value=1_000_000.0, min_value=0.0, step=100_000.0, format="%.2f",
+            key="near_amount",
+        )
+    with c_nc:
+        near_amount_ccy = st.selectbox(
+            "Near in",
+            options=[pair_obj_form.base, pair_obj_form.quote],
+            key="near_amount_ccy",
+            help="If QUOTE, the base notional is derived from spot.",
+        )
 
-    if not free_mode:
-        col8, col9 = st.columns([2, 1])
-        with col8:
-            amount = st.number_input(
-                "Trade amount",
-                value=1_000_000.0,
-                min_value=0.0,
-                step=100_000.0,
-                format="%.2f",
-            )
-        with col9:
-            amount_ccy = st.selectbox(
-                "Amount in",
-                options=[pair_obj_form.base, pair_obj_form.quote],
-                help="If quote ccy, the base notional is derived from spot.",
-            )
-        free_amounts = None
-    else:
-        st.markdown(f"**Near leg ({pair_obj_form.base} / {pair_obj_form.quote})**")
-        c_nb, c_nq = st.columns(2)
-        with c_nb:
-            near_base_amt = st.number_input(
-                f"Near {pair_obj_form.base}",
-                value=1_000_000.0, min_value=0.0, step=100_000.0, format="%.2f",
-                key="free_near_base",
-            )
-        with c_nq:
-            near_quote_amt = st.number_input(
-                f"Near {pair_obj_form.quote}",
-                value=1_000_000.0 * 1.085, min_value=0.0, step=100_000.0, format="%.2f",
-                key="free_near_quote",
-            )
-
-        st.markdown(f"**Far leg ({pair_obj_form.base} / {pair_obj_form.quote})** — mid magnitudes; spread applies to the quote-ccy amount.")
-        c_fb, c_fq = st.columns(2)
-        with c_fb:
-            far_base_amt = st.number_input(
-                f"Far {pair_obj_form.base}",
-                value=1_000_000.0, min_value=0.0, step=100_000.0, format="%.2f",
-                key="free_far_base",
-            )
-        with c_fq:
-            far_quote_amt = st.number_input(
-                f"Far {pair_obj_form.quote} (mid)",
-                value=1_000_000.0 * 1.09, min_value=0.0, step=100_000.0, format="%.2f",
-                key="free_far_quote",
-            )
-        free_amounts = (near_base_amt, near_quote_amt, far_base_amt, far_quote_amt)
-        amount = None
-        amount_ccy = pair_obj_form.base  # not used but keeps the symbol defined
+    c_fa, c_fc = st.columns([2, 1])
+    with c_fa:
+        far_amount = st.number_input(
+            "Far-leg amount",
+            value=1_000_000.0, min_value=0.0, step=100_000.0, format="%.2f",
+            key="far_amount",
+        )
+    with c_fc:
+        far_amount_ccy = st.selectbox(
+            "Far in",
+            options=[pair_obj_form.base, pair_obj_form.quote],
+            key="far_amount_ccy",
+            help="If QUOTE, the base notional is derived from the forward mid.",
+        )
 
     submitted = st.form_submit_button("Quote", width="stretch")
 
 if submitted:
+    near_ccy_key = "BASE" if near_amount_ccy == pair_obj_form.base else "QUOTE"
+    far_ccy_key = "BASE" if far_amount_ccy == pair_obj_form.base else "QUOTE"
     try:
-        if free_amounts is not None:
-            nb, nq, fb, fq = free_amounts
-            t = compute_ticket(
-                pair=pair_obj_form if use_custom_pair else pair_code,
-                side=side,
-                near_date=near_date,
-                far_date=far_date,
-                spot=spot,
-                forward_points=forward_points,
-                spread_pct=spread_pct,
-                near_base_amount=nb,
-                near_quote_amount=nq,
-                far_base_amount=fb,
-                far_quote_amount=fq,
-            )
-        else:
-            amount_ccy_key = "BASE" if amount_ccy == pair_obj_form.base else "QUOTE"
-            t = compute_ticket(
-                pair=pair_obj_form if use_custom_pair else pair_code,
-                side=side,
-                near_date=near_date,
-                far_date=far_date,
-                spot=spot,
-                forward_points=forward_points,
-                spread_pct=spread_pct,
-                amount=amount,
-                amount_ccy=amount_ccy_key,
-            )
+        t = compute_ticket(
+            pair=pair_obj_form,
+            side=side,
+            near_date=near_date,
+            far_date=far_date,
+            spot=spot,
+            forward_points=forward_points,
+            spread_pct=spread_pct,
+            near_amount=near_amount,
+            near_amount_ccy=near_ccy_key,
+            far_amount=far_amount,
+            far_amount_ccy=far_ccy_key,
+        )
     except (ValueError, KeyError) as e:
         st.error(str(e))
         st.stop()
@@ -208,7 +154,7 @@ if submitted:
     c1.metric("Pair", t.pair)
     c2.metric(f"Near leg (base ccy)", near_side)
     c3.metric("Days (ACT)", t.days)
-    if not t.is_free:
+    if not t.is_uneven:
         c4.metric(
             f"Base notional ({t.base_ccy})",
             fmt_money(t.near_base_notional, 2).lstrip("+"),
@@ -319,7 +265,7 @@ if submitted:
     # ---- Footer: informational rate ----
     with st.expander("Implied IR differential and formulas"):
         pip_factor_str = fmt_money(t.pip_factor, 0).lstrip("+")
-        mode_label = "free cashflows" if t.is_free else "matched-base swap"
+        mode_label = "uneven swap" if t.is_uneven else "matched swap"
         st.markdown(
             f"""
 **Pair**: {t.pair}  (base = {t.base_ccy}, quote = {t.quote_ccy}, pip factor = {pip_factor_str}, mode = {mode_label})
@@ -328,13 +274,13 @@ if submitted:
 
 **Market forward client** (spread {('+ ' if t.side == 'BUY' else '− ')}{t.spread_pct:.4f}%): `F_mid × (1 {('+' if t.side == 'BUY' else '−')} s/100) = {fmt_rate(t.forward_client, 6)}`
 
-**Implied rates per leg** (from the cashflows actually used):
-- Near: `{fmt_rate(t.near_leg.fx_rate, 6)}` {"(= spot)" if not t.is_free else "(= near_quote / near_base)"}
-- Far mid: `{fmt_rate(t.far_leg_mid.fx_rate, 6)}` {"(= forward mid)" if not t.is_free else "(= far_quote / far_base)"}
-- Far client: `{fmt_rate(t.far_leg_client.fx_rate, 6)}` {"(= forward client)" if not t.is_free else "(= far_quote × spread_mult / far_base)"}
+**Rates applied per leg**:
+- Near: `{fmt_rate(t.near_leg.fx_rate, 6)}` (= spot)
+- Far mid: `{fmt_rate(t.far_leg_mid.fx_rate, 6)}` (= forward mid)
+- Far client: `{fmt_rate(t.far_leg_client.fx_rate, 6)}` (= forward client)
 
-**IR differential** (market swap rate from implied rates, sign-symmetric):
-`(far_rate_mid − near_rate) / near_rate × 360/days = {fmt_pct(t.market_swap_rate)}` — interpretable as `r_{t.quote_ccy.lower()} − r_{t.base_ccy.lower()}`. This is a market property, not side-dependent.
+**IR differential** (market swap rate, sign-symmetric):
+`(F_mid − S) / S × 360/days = {fmt_pct(t.market_swap_rate)}` — interpretable as `r_{t.quote_ccy.lower()} − r_{t.base_ccy.lower()}`. This is a market property, not side-dependent.
 
 **Carry to your side** (shown above) = `±` IR differential, sign chosen so positive means you earn carry on the ccy you hold over the period. Spread cost is always subtracted.
 

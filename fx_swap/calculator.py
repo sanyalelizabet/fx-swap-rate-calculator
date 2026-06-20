@@ -1,35 +1,28 @@
 """FX swap quoting ticket: cashflows on both legs in both currencies.
 
-Modes
------
-**Matched** (default): the user supplies a single amount + currency. The
-base notional is derived (directly if BASE, or via spot if QUOTE) and
-re-used for both legs. The rates applied on each leg are the market spot
-and the market forward (= spot + points / pip_factor).
+The user supplies one amount per leg (near required, far optional). Each
+amount can be in BASE or QUOTE ccy independently. QUOTE amounts are
+converted to a base notional using the rate that applies on that leg:
+spot for the near leg, forward_mid for the far leg.
 
-**Free cashflows**: the user supplies all four leg-amount magnitudes
-(near_base, near_quote, far_base, far_quote). Signs are applied based on
-the side. Implied rates per leg are derived from the ratios; they need
-not match spot / forward. Useful for tailored / off-market deals.
+If the far amount is omitted, the near base notional is reused for the
+far leg (matched swap). If specified, the legs can have different base
+notionals (uneven swap), but the FX rate per leg remains the market spot
+and forward respectively.
 
 Conventions
 -----------
-* Forward rate from spot and forward points:
-      F = S + P / pip_factor      (matched mode only; in free mode rates are implied)
+* Forward rate: F = S + P / pip_factor
 * The trade is an FX swap. "side" refers to the far-leg base-ccy direction:
       BUY  forward = SELL base spot + BUY  base forward
       SELL forward = BUY  base spot + SELL base forward
-* Cashflow sign convention (from the client's point of view):
-      +  -> client receives
-      -  -> client pays
+* Cashflow sign (from the client's point of view): + receive, - pay.
 * Spread is applied to the far-leg quote amount, always against the client:
-      BUY  -> far quote magnitude * (1 + s/100)   (client pays more)
-      SELL -> far quote magnitude * (1 - s/100)   (client receives less)
-  In matched mode this is equivalent to F_client = F_mid * (1 +/- s/100).
-* days = (far_date - near_date) in calendar days, ACT/360.
-* The annualised swap rate (far_rate_mid - near_rate) / near_rate * 360/days
-  reduces to (F_mid - S)/S * 360/days in matched mode. In free mode it
-  reflects the IR differential implied by the actual cashflows.
+      BUY  -> far quote * (1 + s/100)   (client pays more)
+      SELL -> far quote * (1 - s/100)   (client receives less)
+* days = (far_date - near_date), ACT/360.
+* market_swap_rate = (forward_mid - spot) / spot * 360/days, the implied
+  IR differential r_quote - r_base.
 """
 
 from dataclasses import dataclass
@@ -66,7 +59,7 @@ class SwapTicket:
     spread_pct: float
     near_base_notional: float    # |near_leg.base_flow|
     far_base_notional: float     # |far_leg_mid.base_flow|
-    is_free: bool                # True if free-cashflow mode
+    is_uneven: bool              # True if near and far base notionals differ
 
     near_leg: Leg
     far_leg_mid: Leg
@@ -114,15 +107,20 @@ def compute_ticket(
     spot: float,
     forward_points: float,
     spread_pct: float,
-    # Matched mode:
-    amount: float | None = None,
-    amount_ccy: AmountCcy = "BASE",
-    # Free-cashflow mode (all four required together):
-    near_base_amount: float | None = None,
-    near_quote_amount: float | None = None,
-    far_base_amount: float | None = None,
-    far_quote_amount: float | None = None,
+    near_amount: float,
+    near_amount_ccy: AmountCcy = "BASE",
+    far_amount: float | None = None,
+    far_amount_ccy: AmountCcy = "BASE",
 ) -> SwapTicket:
+    """Build a swap ticket with one amount per leg (near is required; far is
+    optional and defaults to the near base notional for a matched swap).
+
+    Each amount can be in BASE or QUOTE ccy. QUOTE amounts are converted to a
+    base notional using the rate that applies on that leg (spot for near,
+    forward_mid for far). The FX rates applied on each leg remain the market
+    spot and forward respectively; only the notional sizes differ in an
+    uneven swap.
+    """
     if isinstance(pair, str):
         pair = get_pair(pair)
     side = side.upper()  # type: ignore[assignment]
@@ -133,23 +131,8 @@ def compute_ticket(
     if spot <= 0:
         raise ValueError("spot must be positive")
 
-    free_args = (near_base_amount, near_quote_amount, far_base_amount, far_quote_amount)
-    is_free = any(a is not None for a in free_args)
-    if is_free:
-        if any(a is None for a in free_args):
-            raise ValueError(
-                "Free-cashflow mode requires all four amounts: "
-                "near_base_amount, near_quote_amount, far_base_amount, far_quote_amount"
-            )
-        if amount is not None:
-            raise ValueError("Cannot mix matched 'amount' with free-cashflow amounts")
-        for a, name in zip(free_args, ("near_base", "near_quote", "far_base", "far_quote")):
-            if a <= 0:
-                raise ValueError(f"{name}_amount must be strictly positive in free mode")
-    else:
-        if amount is None:
-            raise ValueError("Provide either 'amount' (matched) or the four free-mode amounts")
-        amount_ccy = amount_ccy.upper()  # type: ignore[assignment]
+    near_amount_ccy = near_amount_ccy.upper()  # type: ignore[assignment]
+    far_amount_ccy = far_amount_ccy.upper()    # type: ignore[assignment]
 
     days = (far_date - near_date).days
     forward_mid = spot + forward_points / pair.pip_factor
@@ -157,26 +140,23 @@ def compute_ticket(
     spread_mult = 1.0 + cf_sign * spread_pct / 100.0
     forward_client = forward_mid * spread_mult
 
-    if is_free:
-        near_base_amt = near_base_amount  # type: ignore[assignment]
-        near_quote_amt = near_quote_amount  # type: ignore[assignment]
-        far_base_amt_mid = far_base_amount  # type: ignore[assignment]
-        far_quote_amt_mid = far_quote_amount  # type: ignore[assignment]
+    near_base_amt = _resolve_base_notional(near_amount, near_amount_ccy, spot)
+    if far_amount is None:
+        far_base_amt = near_base_amt
     else:
-        near_base_amt = _resolve_base_notional(amount, amount_ccy, spot)  # type: ignore[arg-type]
-        near_quote_amt = near_base_amt * spot
-        far_base_amt_mid = near_base_amt
-        far_quote_amt_mid = near_base_amt * forward_mid
+        far_base_amt = _resolve_base_notional(far_amount, far_amount_ccy, forward_mid)
+    is_uneven = (far_base_amt != near_base_amt)
 
-    # Spread modifies the FAR leg's quote amount; base is unchanged.
+    near_quote_amt = near_base_amt * spot
+    far_quote_amt_mid = far_base_amt * forward_mid
     far_quote_amt_client = far_quote_amt_mid * spread_mult
 
     near_leg, far_leg_mid = _signed_legs(
-        side, near_base_amt, near_quote_amt, far_base_amt_mid, far_quote_amt_mid,
+        side, near_base_amt, near_quote_amt, far_base_amt, far_quote_amt_mid,
         near_date, far_date,
     )
     _, far_leg_client = _signed_legs(
-        side, near_base_amt, near_quote_amt, far_base_amt_mid, far_quote_amt_client,
+        side, near_base_amt, near_quote_amt, far_base_amt, far_quote_amt_client,
         near_date, far_date,
     )
 
@@ -199,7 +179,7 @@ def compute_ticket(
         spread_pct=spread_pct,
         near_base_notional=abs(near_leg.base_flow),
         far_base_notional=abs(far_leg_mid.base_flow),
-        is_free=is_free,
+        is_uneven=is_uneven,
         near_leg=near_leg,
         far_leg_mid=far_leg_mid,
         far_leg_client=far_leg_client,

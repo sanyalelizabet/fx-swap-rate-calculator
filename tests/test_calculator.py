@@ -5,8 +5,9 @@ import pytest
 from fx_swap import compute_ticket, get_pair, make_custom_pair
 
 
-def _ticket(side="BUY", amount=1_000_000.0, amount_ccy="BASE", spread_pct=0.0,
-            pair="EURUSD", spot=1.0850, points=50.0):
+def _ticket(side="BUY", near_amount=1_000_000.0, near_amount_ccy="BASE",
+            far_amount=None, far_amount_ccy="BASE",
+            spread_pct=0.0, pair="EURUSD", spot=1.0850, points=50.0):
     return compute_ticket(
         pair=pair,
         side=side,
@@ -15,8 +16,10 @@ def _ticket(side="BUY", amount=1_000_000.0, amount_ccy="BASE", spread_pct=0.0,
         spot=spot,
         forward_points=points,
         spread_pct=spread_pct,
-        amount=amount,
-        amount_ccy=amount_ccy,
+        near_amount=near_amount,
+        near_amount_ccy=near_amount_ccy,
+        far_amount=far_amount,
+        far_amount_ccy=far_amount_ccy,
     )
 
 
@@ -38,22 +41,17 @@ def test_days_count_is_calendar():
 
 
 def test_buy_forward_cashflow_signs():
-    # BUY forward = SELL spot + BUY forward.
-    # Near: pay base (-), receive quote (+). Far: receive base (+), pay quote (-).
-    t = _ticket(side="BUY", amount=1_000_000.0)
+    t = _ticket(side="BUY")
     assert t.near_leg.base_flow < 0
     assert t.near_leg.quote_flow > 0
     assert t.far_leg_mid.base_flow > 0
     assert t.far_leg_mid.quote_flow < 0
-    # Magnitudes match notional.
     assert abs(t.near_leg.base_flow) == pytest.approx(1_000_000.0)
     assert abs(t.near_leg.quote_flow) == pytest.approx(1_000_000.0 * 1.0850)
     assert abs(t.far_leg_mid.quote_flow) == pytest.approx(1_000_000.0 * t.forward_mid)
 
 
 def test_sell_forward_cashflow_signs():
-    # SELL forward = BUY spot + SELL forward.
-    # Near: receive base (+), pay quote (-). Far: pay base (-), receive quote (+).
     t = _ticket(side="SELL")
     assert t.near_leg.base_flow > 0
     assert t.near_leg.quote_flow < 0
@@ -61,91 +59,41 @@ def test_sell_forward_cashflow_signs():
     assert t.far_leg_mid.quote_flow > 0
 
 
-def test_amount_in_quote_ccy_derives_base():
-    # 1'085'000 USD in EURUSD spot 1.0850 -> base notional = 1'000'000 EUR.
-    t = _ticket(amount=1_085_000.0, amount_ccy="QUOTE")
+def test_matched_swap_default():
+    # No far_amount -> matched-base swap, far_base = near_base.
+    t = _ticket()
+    assert t.is_uneven is False
+    assert t.near_base_notional == pytest.approx(t.far_base_notional)
+
+
+def test_near_amount_in_quote_uses_spot():
+    # 1'085'000 USD on near, spot 1.0850 -> base = 1'000'000 EUR.
+    t = _ticket(near_amount=1_085_000.0, near_amount_ccy="QUOTE")
     assert t.near_base_notional == pytest.approx(1_000_000.0)
     assert t.far_base_notional == pytest.approx(1_000_000.0)
-    assert t.is_free is False
     assert abs(t.near_leg.quote_flow) == pytest.approx(1_085_000.0)
 
 
-def test_free_mode_uses_entered_amounts_directly():
-    # All four cashflow magnitudes entered; rates may differ from spot/forward.
-    t = compute_ticket(
-        "EURUSD", "BUY", date(2026, 1, 1), date(2026, 4, 1),
-        1.0850, 50.0, 0.0,
-        near_base_amount=1_000_000.0,
-        near_quote_amount=1_083_000.0,   # implies near rate 1.0830, off spot
-        far_base_amount=1_200_000.0,
-        far_quote_amount=1_310_000.0,    # implies far rate ~1.0917
+def test_uneven_swap_separate_base_notionals():
+    t = _ticket(near_amount=1_000_000.0, far_amount=1_500_000.0)
+    assert t.is_uneven is True
+    assert t.near_base_notional == pytest.approx(1_000_000.0)
+    assert t.far_base_notional == pytest.approx(1_500_000.0)
+    assert abs(t.far_leg_mid.quote_flow) == pytest.approx(1_500_000.0 * t.forward_mid)
+
+
+def test_far_amount_in_quote_uses_forward_mid():
+    # Far in QUOTE -> base = quote / forward_mid (NOT spot).
+    t = _ticket(
+        near_amount=1_000_000.0,
+        far_amount=1_090_000.0, far_amount_ccy="QUOTE",
     )
-    assert t.is_free is True
-    assert abs(t.near_leg.base_flow) == pytest.approx(1_000_000.0)
-    assert abs(t.near_leg.quote_flow) == pytest.approx(1_083_000.0)
-    assert abs(t.far_leg_mid.base_flow) == pytest.approx(1_200_000.0)
-    assert abs(t.far_leg_mid.quote_flow) == pytest.approx(1_310_000.0)
-    assert t.near_leg.fx_rate == pytest.approx(1.083)
-    assert t.far_leg_mid.fx_rate == pytest.approx(1_310_000.0 / 1_200_000.0)
-
-
-def test_free_mode_swap_rate_uses_implied_rates():
-    t = compute_ticket(
-        "EURUSD", "BUY", date(2026, 1, 1), date(2026, 4, 1),
-        1.0850, 50.0, 0.0,
-        near_base_amount=1_000_000.0, near_quote_amount=1_083_000.0,
-        far_base_amount=1_000_000.0, far_quote_amount=1_090_000.0,
-    )
-    expected = (1.090 - 1.083) / 1.083 * 360 / 90
-    assert t.market_swap_rate == pytest.approx(expected)
-
-
-def test_free_mode_spread_applies_to_far_quote_buy():
-    t = compute_ticket(
-        "EURUSD", "BUY", date(2026, 1, 1), date(2026, 4, 1),
-        1.0850, 50.0, 0.10,
-        near_base_amount=1_000_000.0, near_quote_amount=1_083_000.0,
-        far_base_amount=1_000_000.0, far_quote_amount=1_090_000.0,
-    )
-    # BUY: client pays more quote on far -> magnitude grows by (1 + s/100).
-    assert abs(t.far_leg_client.quote_flow) == pytest.approx(1_090_000.0 * 1.001)
-    assert t.spread_cost_quote == pytest.approx(1_090_000.0 * 0.001)
-
-
-def test_free_mode_rejects_partial_specification():
-    with pytest.raises(ValueError):
-        compute_ticket(
-            "EURUSD", "BUY", date(2026, 1, 1), date(2026, 4, 1),
-            1.0850, 50.0, 0.0,
-            near_base_amount=1_000_000.0,
-            # missing the other three
-        )
-
-
-def test_free_mode_rejects_mixing_with_matched_amount():
-    with pytest.raises(ValueError):
-        compute_ticket(
-            "EURUSD", "BUY", date(2026, 1, 1), date(2026, 4, 1),
-            1.0850, 50.0, 0.0,
-            amount=1_000_000.0,
-            near_base_amount=1_000_000.0, near_quote_amount=1_083_000.0,
-            far_base_amount=1_000_000.0, far_quote_amount=1_090_000.0,
-        )
-
-
-def test_matched_mode_requires_amount():
-    with pytest.raises(ValueError):
-        compute_ticket(
-            "EURUSD", "BUY", date(2026, 1, 1), date(2026, 4, 1),
-            1.0850, 50.0, 0.0,
-        )
+    assert t.far_base_notional == pytest.approx(1_090_000.0 / t.forward_mid)
 
 
 def test_buy_spread_makes_client_pay_more_quote():
     t = _ticket(side="BUY", spread_pct=0.10)
-    # Client far-leg quote flow is negative; "more pay" = more negative.
     assert t.far_leg_client.quote_flow < t.far_leg_mid.quote_flow
-    # Bank revenue equals the magnitude of the difference, positive.
     assert t.spread_cost_quote == pytest.approx(
         abs(t.far_leg_client.quote_flow - t.far_leg_mid.quote_flow)
     )
@@ -154,7 +102,6 @@ def test_buy_spread_makes_client_pay_more_quote():
 
 def test_sell_spread_makes_client_receive_less_quote():
     t = _ticket(side="SELL", spread_pct=0.10)
-    # Client far-leg quote flow is positive; "less receive" = less positive.
     assert t.far_leg_client.quote_flow < t.far_leg_mid.quote_flow
     assert t.spread_cost_quote > 0
 
@@ -176,7 +123,7 @@ def test_far_must_be_after_near():
     with pytest.raises(ValueError):
         compute_ticket(
             "EURUSD", "BUY", date(2026, 4, 1), date(2026, 1, 1),
-            1.0850, 50.0, 0.0, 1_000_000.0, "BASE",
+            1.0850, 50.0, 0.0, near_amount=1_000_000.0,
         )
 
 
@@ -184,7 +131,7 @@ def test_unknown_pair():
     with pytest.raises(KeyError):
         compute_ticket(
             "XYZABC", "BUY", date(2026, 1, 1), date(2026, 4, 1),
-            1.0, 0.0, 0.0, 1.0, "BASE",
+            1.0, 0.0, 0.0, near_amount=1.0,
         )
 
 
@@ -203,7 +150,7 @@ def test_custom_pair_used_in_compute_ticket():
     pair = make_custom_pair("EUR", "RON")
     t = compute_ticket(
         pair, "BUY", date(2026, 1, 1), date(2026, 4, 1),
-        5.0, 100.0, 0.0, 1_000_000.0, "BASE",
+        5.0, 100.0, 0.0, near_amount=1_000_000.0,
     )
     assert t.pair == "EURRON"
     assert t.base_ccy == "EUR"

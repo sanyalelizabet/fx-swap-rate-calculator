@@ -12,7 +12,7 @@ from datetime import date, timedelta
 import pandas as pd
 import streamlit as st
 
-from fx_swap import compute_ticket, get_pair
+from fx_swap import compute_ticket, get_pair, make_custom_pair
 from fx_swap.pairs import PAIRS
 
 st.set_page_config(page_title="FX Swap Quoting Ticket", layout="centered")
@@ -43,12 +43,31 @@ def fmt_pct(x: float, dp: int = 4) -> str:
 
 # Pair is outside the form so changing it triggers a rerun and refreshes the
 # amount-ccy dropdown options (Streamlit forms suppress reruns until submit).
-pair_code = st.selectbox(
-    "Currency pair",
-    options=sorted(PAIRS.keys()),
-    index=sorted(PAIRS.keys()).index("EURUSD"),
+use_custom_pair = st.checkbox(
+    "Custom pair (enter ccy codes manually)",
+    value=False,
+    help="For pairs not in the dropdown. Pip factor defaults to 100 for JPY-quoted, 10'000 otherwise.",
 )
-pair_obj_form = get_pair(pair_code)
+
+if use_custom_pair:
+    c_base, c_quote = st.columns(2)
+    with c_base:
+        custom_base = st.text_input("Base ccy", value="EUR", max_chars=3).upper().strip()
+    with c_quote:
+        custom_quote = st.text_input("Quote ccy", value="USD", max_chars=3).upper().strip()
+    try:
+        pair_obj_form = make_custom_pair(custom_base, custom_quote)
+    except ValueError as e:
+        st.error(str(e))
+        st.stop()
+    pair_code = pair_obj_form.code
+else:
+    pair_code = st.selectbox(
+        "Currency pair",
+        options=sorted(PAIRS.keys()),
+        index=sorted(PAIRS.keys()).index("EURUSD"),
+    )
+    pair_obj_form = get_pair(pair_code)
 
 with st.form("ticket_inputs"):
     near_side = st.radio(
@@ -136,7 +155,8 @@ if submitted:
         far_amount_ccy_key = "BASE" if far_amount_ccy == pair_obj_form.base else "QUOTE"
     try:
         t = compute_ticket(
-            pair=pair_code,
+            # Pass the FXPair object for custom pairs (string lookup would fail).
+            pair=pair_obj_form if use_custom_pair else pair_code,
             side=side,
             near_date=near_date,
             far_date=far_date,

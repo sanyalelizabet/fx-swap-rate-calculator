@@ -47,3 +47,25 @@ def get_pair(code: str) -> FXPair:
     if code not in PAIRS:
         raise KeyError(f"Unknown pair {code!r}. Known: {sorted(PAIRS)}")
     return PAIRS[code]
+
+
+def make_custom_pair(base: str, quote: str, pip_factor: float | None = None) -> FXPair:
+    """Build an ad-hoc FXPair for any base/quote codes.
+
+    pip_factor defaults to the standard convention (100 for JPY-quoted pairs,
+    10'000 otherwise). Override if a pair quotes pips differently.
+    """
+    base = base.upper().strip()
+    quote = quote.upper().strip()
+    if len(base) != 3 or not base.isalpha():
+        raise ValueError(f"base ccy must be 3 letters, got {base!r}")
+    if len(quote) != 3 or not quote.isalpha():
+        raise ValueError(f"quote ccy must be 3 letters, got {quote!r}")
+    if base == quote:
+        raise ValueError("base and quote must differ")
+    return FXPair(
+        code=f"{base}{quote}",
+        base=base,
+        quote=quote,
+        pip_factor=pip_factor if pip_factor is not None else _pip(quote),
+    )

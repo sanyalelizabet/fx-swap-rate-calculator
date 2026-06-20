@@ -2,7 +2,7 @@ from datetime import date
 
 import pytest
 
-from fx_swap import compute_ticket, get_pair
+from fx_swap import compute_ticket, get_pair, make_custom_pair
 
 
 def _ticket(side="BUY", amount=1_000_000.0, amount_ccy="BASE", spread_pct=0.0,
@@ -145,3 +145,35 @@ def test_unknown_pair():
             "XYZABC", "BUY", date(2026, 1, 1), date(2026, 4, 1),
             1.0, 0.0, 0.0, 1.0, "BASE",
         )
+
+
+def test_custom_pair_jpy_quote_gets_pip_factor_100():
+    pair = make_custom_pair("MYR", "JPY")
+    assert pair.pip_factor == 100
+    assert pair.code == "MYRJPY"
+
+
+def test_custom_pair_non_jpy_defaults_to_10000():
+    pair = make_custom_pair("EUR", "TRY")
+    assert pair.pip_factor == 10_000
+
+
+def test_custom_pair_used_in_compute_ticket():
+    pair = make_custom_pair("EUR", "RON")
+    t = compute_ticket(
+        pair, "BUY", date(2026, 1, 1), date(2026, 4, 1),
+        5.0, 100.0, 0.0, 1_000_000.0, "BASE",
+    )
+    assert t.pair == "EURRON"
+    assert t.base_ccy == "EUR"
+    assert t.quote_ccy == "RON"
+    assert t.forward_mid == pytest.approx(5.0 + 100 / 10_000)
+
+
+def test_custom_pair_rejects_bad_codes():
+    with pytest.raises(ValueError):
+        make_custom_pair("EU", "USD")
+    with pytest.raises(ValueError):
+        make_custom_pair("EUR", "USD2")
+    with pytest.raises(ValueError):
+        make_custom_pair("USD", "USD")

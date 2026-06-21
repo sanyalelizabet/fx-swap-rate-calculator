@@ -303,41 +303,60 @@ def render_quote_tab() -> None:
             "actually quote — the difference is the spread."
         )
 
-        # ---- Carry rate to the client's side (ACT/360) ----
-        # Sign: if the client BUYs base on near, they HOLD base -> carry = -market_rate.
-        # If they SELL base on near, they hold quote -> carry = +market_rate.
-        # Spread always reduces carry. Rates computed from the leg rates actually applied,
-        # so it works in both matched and free-cashflow modes.
-        carry_sign = +1.0 if near_side == "SELL" else -1.0
-        rate_mid_carry = carry_sign * t.market_swap_rate
-        spread_cost_rate = (
-            abs(t.far_leg_client.fx_rate - t.far_leg_mid.fx_rate)
-            / t.near_leg.fx_rate * 360.0 / t.days
-        )
-        rate_client_carry = rate_mid_carry - spread_cost_rate
+        # ---- Client P&L on the swap (round-trip) ----
+        # Sum of both legs per ccy. For a matched swap the base ccy nets to
+        # zero by construction and the P&L lives in the quote ccy; for an
+        # uneven swap both can be non-zero. Spread is always on the quote
+        # far leg, so the base-ccy delta vs mid is always zero.
+        net_base_mid = t.near_leg.base_flow + t.far_leg_mid.base_flow
+        net_quote_mid = t.near_leg.quote_flow + t.far_leg_mid.quote_flow
+        net_base_client = t.near_leg.base_flow + t.far_leg_client.base_flow
+        net_quote_client = t.near_leg.quote_flow + t.far_leg_client.quote_flow
 
-        held_ccy = t.base_ccy if near_side == "BUY" else t.quote_ccy
-        st.subheader(f"Carry rate (ACT/360) — you hold {held_ccy} over the period")
-        c1, c2, c3 = st.columns(3)
+        near_quote_notional = abs(t.near_leg.quote_flow)
+        ann_mid = (net_quote_mid / near_quote_notional * 360.0 / t.days
+                   if near_quote_notional else 0.0)
+        ann_client = (net_quote_client / near_quote_notional * 360.0 / t.days
+                      if near_quote_notional else 0.0)
+
+        st.subheader("Client P&L on the swap (round-trip)")
+        st.caption(
+            f"Sum of both legs per ccy. Ignores anything the client does with "
+            f"the {t.base_ccy} between the legs — pure FX round-trip."
+        )
+        c1, c2 = st.columns(2)
         c1.metric(
-            "Mid",
-            fmt_pct(rate_mid_carry),
-            help=f"Sign-flipped IR differential, expressed from your side. "
-                 f"Positive = you earn carry, negative = you pay it. "
-                 f"= {'+' if carry_sign > 0 else '−'} (F_mid − S)/S × 360/days.",
+            f"Net {t.quote_ccy} at mid",
+            fmt_money(net_quote_mid, 2),
+            help=f"Far {t.quote_ccy} + Near {t.quote_ccy} at the mid forward. "
+                 f"Fair-value round-trip P&L.",
+        )
+        c1.metric(
+            f"Net {t.quote_ccy} at client rate",
+            fmt_money(net_quote_client, 2),
+            delta=fmt_money(net_quote_client - net_quote_mid, 2),
+            delta_color="inverse",
+            help=f"What the client actually pockets in {t.quote_ccy}. "
+                 f"Delta vs mid = spread cost (= bank revenue with opposite sign).",
         )
         c2.metric(
-            "Client",
-            fmt_pct(rate_client_carry),
-            delta=fmt_pct(-spread_cost_rate),
+            f"Annualised on near {t.quote_ccy} notional (mid)",
+            fmt_pct(ann_mid),
+            help=f"Net {t.quote_ccy} / near {t.quote_ccy} notional × 360/days.",
+        )
+        c2.metric(
+            f"Annualised on near {t.quote_ccy} notional (client)",
+            fmt_pct(ann_client),
+            delta=fmt_pct(ann_client - ann_mid),
             delta_color="inverse",
-            help="Mid carry minus the spread cost (always reduces carry, regardless of side).",
         )
-        c3.metric(
-            "Spread cost (rate)",
-            fmt_pct(spread_cost_rate),
-            help="|F_client − F_mid| / S × 360/days. Always positive.",
-        )
+
+        if abs(net_base_mid) > 1e-9:
+            st.caption(
+                f"Uneven swap — non-zero net in {t.base_ccy}: "
+                f"`{fmt_money(net_base_mid, 2)}` (same at mid and client; "
+                f"spread is in {t.quote_ccy} only)."
+            )
 
         # ---- Spread P&L in quote ccy ----
         st.subheader("Spread (quote ccy)")

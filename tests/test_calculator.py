@@ -7,7 +7,7 @@ from fx_swap import compute_ticket, get_pair, make_custom_pair
 
 def _ticket(side="BUY", near_amount=1_000_000.0, near_amount_ccy="BASE",
             far_amount=None, far_amount_ccy="BASE",
-            spread_pct=0.0, pair="EURUSD", spot=1.0850, points=50.0):
+            spread_rate=0.0, pair="EURUSD", spot=1.0850, points=50.0):
     return compute_ticket(
         pair=pair,
         side=side,
@@ -15,7 +15,7 @@ def _ticket(side="BUY", near_amount=1_000_000.0, near_amount_ccy="BASE",
         far_date=date(2026, 4, 1),
         spot=spot,
         forward_points=points,
-        spread_pct=spread_pct,
+        spread_rate=spread_rate,
         near_amount=near_amount,
         near_amount_ccy=near_amount_ccy,
         far_amount=far_amount,
@@ -82,17 +82,22 @@ def test_uneven_swap_separate_base_notionals():
     assert abs(t.far_leg_mid.quote_flow) == pytest.approx(1_500_000.0 * t.forward_mid)
 
 
-def test_far_amount_in_quote_uses_forward_mid():
-    # Far in QUOTE -> base = quote / forward_mid (NOT spot).
+def test_far_amount_in_quote_uses_forward_client():
+    # Far in QUOTE -> base = quote / forward_client (preserves the user-entered
+    # quote amount as the actual client cashflow on the far leg).
     t = _ticket(
         near_amount=1_000_000.0,
         far_amount=1_090_000.0, far_amount_ccy="QUOTE",
+        spread_rate=0.001,
     )
-    assert t.far_base_notional == pytest.approx(1_090_000.0 / t.forward_mid)
+    assert t.far_base_notional == pytest.approx(1_090_000.0 / t.forward_client)
+    # And the client-leg quote cashflow equals what the user typed.
+    assert abs(t.far_leg_client.quote_flow) == pytest.approx(1_090_000.0)
 
 
-def test_buy_spread_makes_client_pay_more_quote():
-    t = _ticket(side="BUY", spread_pct=0.10)
+def test_buy_spread_pushes_forward_up_and_costs_client_quote():
+    t = _ticket(side="BUY", spread_rate=0.001)
+    assert t.forward_client == pytest.approx(t.forward_mid + 0.001)
     assert t.far_leg_client.quote_flow < t.far_leg_mid.quote_flow
     assert t.spread_cost_quote == pytest.approx(
         abs(t.far_leg_client.quote_flow - t.far_leg_mid.quote_flow)
@@ -100,17 +105,44 @@ def test_buy_spread_makes_client_pay_more_quote():
     assert t.spread_cost_quote > 0
 
 
-def test_sell_spread_makes_client_receive_less_quote():
-    t = _ticket(side="SELL", spread_pct=0.10)
+def test_sell_spread_pushes_forward_down_and_costs_client_quote():
+    t = _ticket(side="SELL", spread_rate=0.001)
+    assert t.forward_client == pytest.approx(t.forward_mid - 0.001)
     assert t.far_leg_client.quote_flow < t.far_leg_mid.quote_flow
     assert t.spread_cost_quote > 0
 
 
 def test_zero_spread_keeps_client_and_mid_equal():
-    t = _ticket(spread_pct=0.0)
+    t = _ticket(spread_rate=0.0)
     assert t.forward_client == pytest.approx(t.forward_mid)
     assert t.far_leg_client.quote_flow == pytest.approx(t.far_leg_mid.quote_flow)
     assert t.spread_cost_quote == pytest.approx(0.0)
+
+
+def test_eurchf_matched_quote_swap():
+    # Trader-level test case: matched in CHF (595k each leg), absolute-rate
+    # spread of 0.001395 added on top of (spot + pips). Near leg uses spot,
+    # far leg uses F_client so the user-entered CHF amount is preserved.
+    # side=BUY because the client sells EUR on near, buys EUR back on far.
+    t = compute_ticket(
+        pair=make_custom_pair("EUR", "CHF"),
+        side="BUY",
+        near_date=date(2026, 6, 22),
+        far_date=date(2026, 9, 20),
+        spot=0.93003,
+        forward_points=-49.31,           # -49.31 pips = -0.004931 rate (pip_factor=10000)
+        spread_rate=0.001395,
+        near_amount=595_000.0, near_amount_ccy="QUOTE",
+        far_amount=595_000.0, far_amount_ccy="QUOTE",
+    )
+    assert t.forward_mid == pytest.approx(0.925099, abs=1e-6)
+    assert t.forward_client == pytest.approx(0.926494, abs=1e-6)
+    # Near leg: -639'764.31 EUR / +595'000 CHF
+    assert t.near_leg.base_flow == pytest.approx(-639_764.31, abs=0.01)
+    assert t.near_leg.quote_flow == pytest.approx(+595_000.0, abs=0.01)
+    # Far leg at client: +642'205.99 EUR / -595'000 CHF
+    assert t.far_leg_client.base_flow == pytest.approx(+642_205.99, abs=0.01)
+    assert t.far_leg_client.quote_flow == pytest.approx(-595_000.0, abs=0.01)
 
 
 def test_market_swap_rate_is_ir_differential():

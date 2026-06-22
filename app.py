@@ -163,11 +163,13 @@ def render_quote_tab() -> None:
         with col7:
             spread_pct = st.number_input(
                 "Client spread (%)",
-                value=0.10,
+                value=0.1000,
                 min_value=0.0,
                 format="%.4f",
-                help="Applied to the far leg only, always against the client.",
+                help="Percentage of spot. spread_rate = spot * (%) / 100. "
+                     "F_client = F_mid ± spread_rate, always against the client.",
             )
+            spread_rate = spot * spread_pct / 100.0
 
         st.markdown("**Amounts** — one per leg, each in BASE or QUOTE ccy.")
         c_na, c_nc = st.columns([2, 1])
@@ -213,7 +215,7 @@ def render_quote_tab() -> None:
                 far_date=far_date,
                 spot=spot,
                 forward_points=forward_points,
-                spread_pct=spread_pct,
+                spread_rate=spread_rate,
                 near_amount=near_amount,
                 near_amount_ccy=near_ccy_key,
                 far_amount=far_amount,
@@ -313,11 +315,15 @@ def render_quote_tab() -> None:
         net_base_client = t.near_leg.base_flow + t.far_leg_client.base_flow
         net_quote_client = t.near_leg.quote_flow + t.far_leg_client.quote_flow
 
-        near_quote_notional = abs(t.near_leg.quote_flow)
-        ann_mid = (net_quote_mid / near_quote_notional * 360.0 / t.days
-                   if near_quote_notional else 0.0)
-        ann_client = (net_quote_client / near_quote_notional * 360.0 / t.days
-                      if near_quote_notional else 0.0)
+        # Rate-based annualised round-trip P&L. Independent of notionals so
+        # uneven swaps don't smear an outright trade into the carry number.
+        # Sign convention matches the cashflow round-trip for a matched swap:
+        #   side=BUY  (client sells base near, buys back far): P&L = +N·(S − F)
+        #   side=SELL (client buys base near, sells back far): P&L = −N·(S − F)
+        # Annualise by /S × 360/days. cf_sign flips for SELL.
+        cf_sign = 1.0 if t.side == "BUY" else -1.0
+        ann_mid = -cf_sign * (t.forward_mid - t.spot) / t.spot * 360.0 / t.days
+        ann_client = -cf_sign * (t.forward_client - t.spot) / t.spot * 360.0 / t.days
 
         st.subheader("Client P&L on the swap (round-trip)")
         st.caption(
@@ -326,29 +332,33 @@ def render_quote_tab() -> None:
         )
         c1, c2 = st.columns(2)
         c1.metric(
-            f"Net {t.quote_ccy} at mid",
+            f"Net {t.quote_ccy} before spread",
             fmt_money(net_quote_mid, 2),
             help=f"Far {t.quote_ccy} + Near {t.quote_ccy} at the mid forward. "
-                 f"Fair-value round-trip P&L.",
+                 f"Fair-value round-trip P&L (no spread applied).",
         )
         c1.metric(
-            f"Net {t.quote_ccy} at client rate",
+            f"Net {t.quote_ccy} after spread",
             fmt_money(net_quote_client, 2),
             delta=fmt_money(net_quote_client - net_quote_mid, 2),
             delta_color="inverse",
-            help=f"What the client actually pockets in {t.quote_ccy}. "
-                 f"Delta vs mid = spread cost (= bank revenue with opposite sign).",
+            help=f"What the client actually pockets in {t.quote_ccy} once the "
+                 f"spread is applied. Delta = spread cost (= bank revenue with opposite sign).",
         )
         c2.metric(
-            f"Annualised on near {t.quote_ccy} notional (mid)",
+            "Annualised round-trip rate (before spread)",
             fmt_pct(ann_mid),
-            help=f"Net {t.quote_ccy} / near {t.quote_ccy} notional × 360/days.",
+            help="−sign(side) · (F_mid − S) / S · 360/days. "
+                 "Side-aware; positive = client earns, negative = client pays. "
+                 "Notional-independent — works the same for matched and uneven swaps.",
         )
         c2.metric(
-            f"Annualised on near {t.quote_ccy} notional (client)",
+            "Annualised round-trip rate (after spread)",
             fmt_pct(ann_client),
             delta=fmt_pct(ann_client - ann_mid),
             delta_color="inverse",
+            help="Same formula with F_client (spread applied). "
+                 "Delta = annualised spread cost = −(pct/100) · 360/days.",
         )
 
         if abs(net_base_mid) > 1e-9:
@@ -368,8 +378,9 @@ def render_quote_tab() -> None:
                  "This is what the client pays extra (or receives less) compared to mid.",
         )
         c2.metric(
-            "Spread (% of far leg)",
-            fmt_pct(t.spread_pct / 100, 4),
+            "Spread (rate)",
+            fmt_rate(t.spread_rate, 6),
+            help="Derived from spot * (%) / 100. F_client = F_mid ± spread.",
         )
 
         # ---- Footer: informational rate ----
@@ -382,7 +393,7 @@ def render_quote_tab() -> None:
 
     **Market forward mid**: `S + P/pip = {fmt_rate(t.spot, 6)} + {fmt_rate(t.forward_points, 4)} / {pip_factor_str} = {fmt_rate(t.forward_mid, 6)}`
 
-    **Market forward client** (spread {('+ ' if t.side == 'BUY' else '− ')}{t.spread_pct:.4f}%): `F_mid × (1 {('+' if t.side == 'BUY' else '−')} s/100) = {fmt_rate(t.forward_client, 6)}`
+    **Market forward client** (spread {('+ ' if t.side == 'BUY' else '− ')}{t.spread_rate:.6f}): `F_mid {('+' if t.side == 'BUY' else '−')} spread = {fmt_rate(t.forward_client, 6)}`
 
     **Rates applied per leg**:
     - Near: `{fmt_rate(t.near_leg.fx_rate, 6)}` (= spot)

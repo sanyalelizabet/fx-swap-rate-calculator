@@ -3,23 +3,25 @@
 The user supplies one amount per leg (near required, far optional). Each
 amount can be in BASE or QUOTE ccy independently. QUOTE amounts are
 converted to a base notional using the rate that applies on that leg:
-spot for the near leg, forward_mid for the far leg.
+spot for the near leg, forward_client for the far leg (so a user-entered
+far quote amount is preserved as the actual client cashflow).
 
 If the far amount is omitted, the near base notional is reused for the
 far leg (matched swap). If specified, the legs can have different base
-notionals (uneven swap), but the FX rate per leg remains the market spot
-and forward respectively.
+notionals (uneven swap), but the FX rates applied on each leg remain the
+market spot and the client forward respectively.
 
 Conventions
 -----------
-* Forward rate: F = S + P / pip_factor
+* Forward rate: F_mid = S + P / pip_factor.
 * The trade is an FX swap. "side" refers to the far-leg base-ccy direction:
       BUY  forward = SELL base spot + BUY  base forward
       SELL forward = BUY  base spot + SELL base forward
 * Cashflow sign (from the client's point of view): + receive, - pay.
-* Spread is applied to the far-leg quote amount, always against the client:
-      BUY  -> far quote * (1 + s/100)   (client pays more)
-      SELL -> far quote * (1 - s/100)   (client receives less)
+* Spread is an absolute rate add-on applied to the forward, always against
+  the client:
+      F_client = F_mid + spread_rate    (BUY  -> client pays more quote per base)
+      F_client = F_mid - spread_rate    (SELL -> client receives less quote per base)
 * days = (far_date - near_date), ACT/360.
 * market_swap_rate = (forward_mid - spot) / spot * 360/days, the implied
   IR differential r_quote - r_base.
@@ -55,8 +57,8 @@ class SwapTicket:
     forward_points: float
     pip_factor: float
     forward_mid: float           # market reference: S + P/pip
-    forward_client: float        # market reference: F_mid * (1 +/- s/100)
-    spread_pct: float
+    forward_client: float        # F_mid +/- spread_rate (sign depends on side)
+    spread_rate: float           # absolute rate add-on, always >= 0
     near_base_notional: float    # |near_leg.base_flow|
     far_base_notional: float     # |far_leg_mid.base_flow|
     is_uneven: bool              # True if near and far base notionals differ
@@ -106,7 +108,7 @@ def compute_ticket(
     far_date: date,
     spot: float,
     forward_points: float,
-    spread_pct: float,
+    spread_rate: float,
     near_amount: float,
     near_amount_ccy: AmountCcy = "BASE",
     far_amount: float | None = None,
@@ -116,10 +118,15 @@ def compute_ticket(
     optional and defaults to the near base notional for a matched swap).
 
     Each amount can be in BASE or QUOTE ccy. QUOTE amounts are converted to a
-    base notional using the rate that applies on that leg (spot for near,
-    forward_mid for far). The FX rates applied on each leg remain the market
-    spot and forward respectively; only the notional sizes differ in an
-    uneven swap.
+    base notional using the rate that applies on that leg: spot for the near
+    leg, forward_client for the far leg (so the user-entered far quote amount
+    is preserved as the client's actual cashflow). The mid leg shows what the
+    quote would have been at the fair forward for the same base notional.
+
+    `spread_rate` is an absolute rate add-on (e.g. 0.001395 for EUR/CHF),
+    applied to the forward against the client:
+        F_client = F_mid + spread_rate   (side=BUY:  client pays more quote)
+        F_client = F_mid - spread_rate   (side=SELL: client receives less quote)
     """
     if isinstance(pair, str):
         pair = get_pair(pair)
@@ -130,6 +137,8 @@ def compute_ticket(
         raise ValueError("far_date must be strictly after near_date")
     if spot <= 0:
         raise ValueError("spot must be positive")
+    if spread_rate < 0:
+        raise ValueError("spread_rate must be non-negative")
 
     near_amount_ccy = near_amount_ccy.upper()  # type: ignore[assignment]
     far_amount_ccy = far_amount_ccy.upper()    # type: ignore[assignment]
@@ -137,19 +146,18 @@ def compute_ticket(
     days = (far_date - near_date).days
     forward_mid = spot + forward_points / pair.pip_factor
     cf_sign = 1.0 if side == "BUY" else -1.0
-    spread_mult = 1.0 + cf_sign * spread_pct / 100.0
-    forward_client = forward_mid * spread_mult
+    forward_client = forward_mid + cf_sign * spread_rate
 
     near_base_amt = _resolve_base_notional(near_amount, near_amount_ccy, spot)
     if far_amount is None:
         far_base_amt = near_base_amt
     else:
-        far_base_amt = _resolve_base_notional(far_amount, far_amount_ccy, forward_mid)
+        far_base_amt = _resolve_base_notional(far_amount, far_amount_ccy, forward_client)
     is_uneven = (far_base_amt != near_base_amt)
 
     near_quote_amt = near_base_amt * spot
     far_quote_amt_mid = far_base_amt * forward_mid
-    far_quote_amt_client = far_quote_amt_mid * spread_mult
+    far_quote_amt_client = far_base_amt * forward_client
 
     near_leg, far_leg_mid = _signed_legs(
         side, near_base_amt, near_quote_amt, far_base_amt, far_quote_amt_mid,
@@ -176,7 +184,7 @@ def compute_ticket(
         pip_factor=pair.pip_factor,
         forward_mid=forward_mid,
         forward_client=forward_client,
-        spread_pct=spread_pct,
+        spread_rate=spread_rate,
         near_base_notional=abs(near_leg.base_flow),
         far_base_notional=abs(far_leg_mid.base_flow),
         is_uneven=is_uneven,

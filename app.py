@@ -1,10 +1,10 @@
 """Streamlit quoting ticket for an FX swap.
 
-Inputs: pair, side (BUY/SELL the base ccy forward), near + far dates, spot,
-forward points (pips), client spread (%), amount + which ccy it's in.
+Inputs: pair (base/quote/pip factor), side, near + far dates, spot,
+forward points (pips), client spread (% of spot OR pips), notionals.
 
-Output: full cashflow ticket showing both legs in both currencies, with
-the spread cost in quote ccy and the implied IR differential as a footer.
+Output: 1) Quote (rates), 2) Round-trip P&L, 3) Cashflows, then details.
+Calculation lives in fx_swap.calculator; this file is UI only.
 """
 
 from datetime import date, timedelta
@@ -14,18 +14,14 @@ import streamlit as st
 
 from fx_swap import compute_ticket, make_custom_pair
 
-st.set_page_config(page_title="FX Swap Quoting Ticket", layout="centered")
+st.set_page_config(page_title="FX Swap Quoting Ticket", layout="wide")
 
-st.title("FX Swap Quoting Ticket")
-st.caption(
-    "ACT/360. Matched-notional FX swap. Cashflows are signed from the client's "
-    "perspective: positive = the client receives, negative = the client pays. "
-    "Spread is applied to the far leg only and always disadvantages the client."
-)
+# Streamlit's colored-text marker used everywhere we highlight the client side.
+CLIENT_COLOR = "orange"
 
 
 def fmt_money(x: float, dp: int = 2) -> str:
-    """Swiss-style with apostrophe thousands and an explicit sign for non-zero."""
+    """Swiss-style with apostrophe thousands and explicit sign for non-zero."""
     if x == 0:
         return f"{0:,.{dp}f}".replace(",", "'")
     sign = "+" if x > 0 else "-"
@@ -40,8 +36,6 @@ def fmt_pct(x: float, dp: int = 4) -> str:
     return f"{x * 100:.{dp}f}%"
 
 
-
-
 def render_cheat_sheet() -> None:
     st.markdown(
         """
@@ -49,367 +43,340 @@ def render_cheat_sheet() -> None:
 
 | Forward points | Forward vs spot | Means |
 |---|---|---|
-| **Positive** (F > S) | base ccy at **premium** | base ccy interest rate is **lower** than quote ccy |
-| **Negative** (F < S) | base ccy at **discount** | base ccy interest rate is **higher** than quote ccy |
+| **Positive** (F > S) | base ccy at **premium** | base ccy rate **lower** than quote ccy |
+| **Negative** (F < S) | base ccy at **discount** | base ccy rate **higher** than quote ccy |
 
-The forward is just the no-arbitrage price built from `F = S × (1 + r_quote × t/360) / (1 + r_base × t/360)`. If quote yields more, F has to be higher to compensate.
+`F = S × (1 + r_quote × t/360) / (1 + r_base × t/360)`
 
 ---
 
 ### Bank spread direction (always against the client)
 
-Spread is taken on the **far leg only**. Direction depends on what the client does on the near leg:
+Far leg only. Bank quotes a far rate worse for whatever direction the client trades on the far leg.
 
-| Client on near leg | Client on far leg | To take spread, bank shifts F | Forward points |
+| Client on near | Client on far | Bank shifts F | Forward points |
 |---|---|---|---|
-| **SELLS base** | buys base back | quote a **higher** far rate | **GO UP** |
-| **BUYS base** | sells base back | quote a **lower** far rate | **GO DOWN** |
-
-Mnemonic: the bank always quotes a far rate that is **worse** for whatever direction the client trades on the far leg.
+| **SELLS base** | buys base back | **up** | go up |
+| **BUYS base** | sells base back | **down** | go down |
 
 ---
 
-### Who earns carry over the swap
+### Carry to the client
 
-Whichever ccy the client **bought on the near leg** is the one they hold until the far date — and that is the rate they earn.
+Whichever ccy the client bought on the near leg is what they hold over the period.
 
-| Client near | Holds over period | Carry to client |
+| Client near | Holds | Carry |
 |---|---|---|
 | BUYS base | base | `r_base − r_quote` |
 | SELLS base | quote | `r_quote − r_base` |
 
-Spread always **reduces** this carry, regardless of side. The bank never gives carry away.
-
----
-
-### Quick sanity checks while quoting
-
-- If your **forward points are positive** and the client is **buying base on near**, they hold the lower-yielding ccy → negative carry → they pay carry. Add spread → they pay even more.
-- If your **forward points are negative** and the client is **selling base on near**, they hold the higher-yielding ccy → positive carry → they earn. Spread eats into that.
-- If carry-to-client and the forward-points sign tell different stories about the side, check the side radio — easy to fool yourself.
+Spread always reduces this carry.
         """
     )
 
 
-def render_quote_tab() -> None:
-    # Pair lives outside the form so changing the ccys triggers a rerun and the
-    # amount-ccy dropdowns pick up the new base/quote (Streamlit forms suppress
-    # reruns until submit).
-    c_base, c_quote = st.columns(2)
-    with c_base:
-        custom_base = st.text_input("Base ccy", value="EUR", max_chars=3).upper().strip()
-    with c_quote:
-        custom_quote = st.text_input("Quote ccy", value="USD", max_chars=3).upper().strip()
+def _render_inputs() -> dict | None:
+    """Sidebar form. Returns inputs dict on submit, else None."""
+    st.sidebar.title("Trade")
 
-    try:
-        pair_obj_form = make_custom_pair(custom_base, custom_quote)
-    except ValueError as e:
-        st.error(str(e))
-        st.stop()
+    with st.sidebar:
+        # Pair + pip factor + side stay outside the form so changing them
+        # reruns the page and dependent UI updates.
+        cb, cq = st.columns(2)
+        base = cb.text_input("Base", value="EUR", max_chars=3).upper().strip()
+        quote = cq.text_input("Quote", value="USD", max_chars=3).upper().strip()
 
-    # Side lives outside the form so that changing it triggers a rerun and the
-    # side-dependent help text on Forward points refreshes (Streamlit forms
-    # suppress reruns until submit).
-    near_side = st.radio(
-        "Side (on the base ccy near leg)",
-        options=["BUY", "SELL"],
-        horizontal=True,
-        help="What you do on the near (spot) leg. Far leg is automatically the opposite.",
-    )
-    # Calculator expects the far-leg side. Near leg is always opposite.
-    side = "SELL" if near_side == "BUY" else "BUY"
+        try:
+            # Validate the codes early.
+            _default_pair = make_custom_pair(base, quote)
+        except ValueError as e:
+            st.error(str(e))
+            st.stop()
 
-    with st.form("ticket_inputs"):
+        # Per-quote-ccy key so switching the quote ccy resets the pip factor
+        # back to its market default (10'000 or 100 for JPY).
+        pip_factor = st.number_input(
+            "Pip factor",
+            value=float(_default_pair.pip_factor),
+            min_value=1.0,
+            step=1.0,
+            format="%.0f",
+            key=f"pip_factor_{quote}",
+            help="Forward points are divided by this to get a quote-ccy rate add-on. "
+                 "Defaults to 10'000 (or 100 if quote is JPY). Edit only if your pair "
+                 "quotes pips on a non-standard convention.",
+        )
 
-        col3, col4 = st.columns(2)
-        today = date.today()
-        with col3:
-            near_date = st.date_input("Near date", value=today + timedelta(days=2))
-        with col4:
-            far_date = st.date_input("Far date", value=today + timedelta(days=92))
+        try:
+            pair_obj = make_custom_pair(base, quote, pip_factor=pip_factor)
+        except ValueError as e:
+            st.error(str(e))
+            st.stop()
 
-        col5, col6, col7 = st.columns(3)
-        with col5:
-            spot = st.number_input("Spot rate", value=1.0850, format="%.6f", min_value=0.0)
-        with col6:
-            # Direction of pip changes on the client's annualised carry depends
-            # on the near-leg side. Carry = ± (F - S)/S × 360/days, sign chosen
-            # so the ccy the client HOLDS over the period yields positive carry.
-            # near BUY base  -> holds base  -> carry sign is negative on (F-S),
-            #                  so MORE pips (higher F) -> LOWER carry to client.
-            # near SELL base -> holds quote -> carry sign is positive on (F-S),
-            #                  so MORE pips (higher F) -> HIGHER carry to client.
-            if near_side == "BUY":
-                pip_tip = (
-                    "**Tip (you BUY base on near):** more pips → **lower** carry "
-                    "rate to the client (you pay more in CHF/quote-ccy carry). "
-                    "Fewer pips → higher carry."
-                )
-            else:
-                pip_tip = (
-                    "**Tip (you SELL base on near):** more pips → **higher** carry "
-                    "rate to the client (you earn more). "
-                    "Fewer pips → lower carry."
-                )
+        near_side_label = st.radio(
+            "Side (near / far)",
+            options=["Buy/Sell", "Sell/Buy"],
+            horizontal=True,
+            help=(
+                f"Buy/Sell = buy {pair_obj.base} on near, sell {pair_obj.base} "
+                f"back on far. Sell/Buy = the opposite."
+            ),
+        )
+        # Calculator expects the far-leg side. Near is always opposite.
+        side = "SELL" if near_side_label == "Buy/Sell" else "BUY"
+
+        st.divider()
+
+        with st.form("ticket_inputs", border=False):
+            today = date.today()
+            cd1, cd2 = st.columns(2)
+            near_date = cd1.date_input("Near date", value=today + timedelta(days=2))
+            far_date = cd2.date_input("Far date", value=today + timedelta(days=92))
+
+            spot = st.number_input(
+                "Spot", value=1.0850, format="%.6f", min_value=0.0,
+            )
             forward_points = st.number_input(
                 "Forward points (pips)",
                 value=50.0,
                 format="%.4f",
-                help=(
-                    "Sign matters. Positive = base ccy at premium forward.\n\n"
-                    + pip_tip
-                ),
+                help="Signed. Positive = base ccy at premium forward.",
             )
-        with col7:
-            spread_pct = st.number_input(
-                "Client spread (%)",
+
+            cs1, cs2 = st.columns([2, 1])
+            spread_value = cs1.number_input(
+                "Spread",
                 value=0.1000,
                 min_value=0.0,
                 format="%.4f",
-                help="Percentage of spot. spread_rate = spot * (%) / 100. "
-                     "F_client = F_mid ± spread_rate, always against the client.",
+                help=(
+                    "Applied against the client on the far leg.\n\n"
+                    "% of spot → spread_rate = spot × (%) / 100\n\n"
+                    "Pips → spread_rate = pips / pip_factor"
+                ),
             )
-            spread_rate = spot * spread_pct / 100.0
+            spread_unit = cs2.selectbox(
+                "Unit",
+                options=["% of spot", "Pips"],
+                index=0,
+                label_visibility="collapsed",
+            )
+            if spread_unit == "% of spot":
+                spread_rate = spot * spread_value / 100.0
+            else:
+                spread_rate = spread_value / pair_obj.pip_factor
 
-        st.markdown("**Amounts** — one per leg, each in BASE or QUOTE ccy.")
-        c_na, c_nc = st.columns([2, 1])
-        with c_na:
-            near_amount = st.number_input(
-                "Near-leg amount",
+            st.markdown("**Notionals**")
+            cn1, cn2 = st.columns([2, 1])
+            near_amount = cn1.number_input(
+                "Near leg",
                 value=1_000_000.0, min_value=0.0, step=100_000.0, format="%.2f",
                 key="near_amount",
             )
-        with c_nc:
-            near_amount_ccy = st.selectbox(
-                "Near in",
-                options=[pair_obj_form.base, pair_obj_form.quote],
+            near_amount_ccy = cn2.selectbox(
+                "in",
+                options=[pair_obj.base, pair_obj.quote],
                 key="near_amount_ccy",
-                help="If QUOTE, the base notional is derived from spot.",
             )
 
-        c_fa, c_fc = st.columns([2, 1])
-        with c_fa:
-            far_amount = st.number_input(
-                "Far-leg amount",
+            cf1, cf2 = st.columns([2, 1])
+            far_amount = cf1.number_input(
+                "Far leg",
                 value=1_000_000.0, min_value=0.0, step=100_000.0, format="%.2f",
                 key="far_amount",
             )
-        with c_fc:
-            far_amount_ccy = st.selectbox(
-                "Far in",
-                options=[pair_obj_form.base, pair_obj_form.quote],
+            far_amount_ccy = cf2.selectbox(
+                "in",
+                options=[pair_obj.base, pair_obj.quote],
                 key="far_amount_ccy",
-                help="If QUOTE, the base notional is derived from the forward mid.",
             )
 
-        submitted = st.form_submit_button("Quote", width="stretch")
-
-    if submitted:
-        near_ccy_key = "BASE" if near_amount_ccy == pair_obj_form.base else "QUOTE"
-        far_ccy_key = "BASE" if far_amount_ccy == pair_obj_form.base else "QUOTE"
-        try:
-            t = compute_ticket(
-                pair=pair_obj_form,
-                side=side,
-                near_date=near_date,
-                far_date=far_date,
-                spot=spot,
-                forward_points=forward_points,
-                spread_rate=spread_rate,
-                near_amount=near_amount,
-                near_amount_ccy=near_ccy_key,
-                far_amount=far_amount,
-                far_amount_ccy=far_ccy_key,
-            )
-        except (ValueError, KeyError) as e:
-            st.error(str(e))
-            st.stop()
-
-        # Use the pair object we already built (works for both registry and custom pairs).
-        pair_obj = pair_obj_form
-
-        # ---- Header strip ----
-        st.subheader("Trade summary")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Pair", t.pair)
-        c2.metric(f"Near leg (base ccy)", near_side)
-        c3.metric("Days (ACT)", t.days)
-        if not t.is_uneven:
-            c4.metric(
-                f"Base notional ({t.base_ccy})",
-                fmt_money(t.near_base_notional, 2).lstrip("+"),
-            )
-        else:
-            c4.metric(
-                f"Notional near / far ({t.base_ccy})",
-                f"{fmt_money(t.near_base_notional, 2).lstrip('+')} / {fmt_money(t.far_base_notional, 2).lstrip('+')}",
+            submitted = st.form_submit_button(
+                "Quote", use_container_width=True, type="primary"
             )
 
-        # ---- Rates strip ----
-        st.subheader("Rates")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Spot", fmt_rate(t.spot, 6))
-        c2.metric("Forward mid", fmt_rate(t.forward_mid, 6))
-        c3.metric(
-            "Forward client",
-            fmt_rate(t.forward_client, 6),
-            delta=fmt_rate(t.forward_client - t.forward_mid, 6),
-            delta_color="inverse",
+        if not submitted:
+            return None
+
+        return dict(
+            pair_obj=pair_obj,
+            side=side,
+            near_side_label=near_side_label,
+            near_date=near_date,
+            far_date=far_date,
+            spot=spot,
+            forward_points=forward_points,
+            spread_rate=spread_rate,
+            spread_value=spread_value,
+            spread_unit=spread_unit,
+            near_amount=near_amount,
+            near_amount_ccy="BASE" if near_amount_ccy == pair_obj.base else "QUOTE",
+            far_amount=far_amount,
+            far_amount_ccy="BASE" if far_amount_ccy == pair_obj.base else "QUOTE",
         )
 
-        # Forward points: mid (user input echo) vs client (with spread applied).
-        fwd_points_client = (t.forward_client - t.spot) * t.pip_factor
-        fwd_points_spread = fwd_points_client - t.forward_points
-        c4, c5 = st.columns(2)
-        c4.metric("Forward points (mid)", fmt_rate(t.forward_points, 4))
-        c5.metric(
-            "Forward points (client)",
-            fmt_rate(fwd_points_client, 4),
-            delta=fmt_rate(fwd_points_spread, 4),
-            delta_color="inverse",
-            help="Forward points with the client spread baked in: "
-                 "(F_client − S) × pip_factor. Delta vs mid = the spread in pips.",
-        )
 
-        # ---- Cashflows table ----
-        st.subheader("Cashflows (from the client's perspective)")
-        rows = [
-            {
-                "Leg": "Near (spot)",
-                "Value date": t.near_leg.value_date.isoformat(),
-                "Rate": fmt_rate(t.near_leg.fx_rate, 6),
-                f"{t.base_ccy}": fmt_money(t.near_leg.base_flow, 2),
-                f"{t.quote_ccy}": fmt_money(t.near_leg.quote_flow, 2),
-            },
-            {
-                "Leg": "Far (mid)",
-                "Value date": t.far_leg_mid.value_date.isoformat(),
-                "Rate": fmt_rate(t.far_leg_mid.fx_rate, 6),
-                f"{t.base_ccy}": fmt_money(t.far_leg_mid.base_flow, 2),
-                f"{t.quote_ccy}": fmt_money(t.far_leg_mid.quote_flow, 2),
-            },
-            {
-                "Leg": "Far (client)",
-                "Value date": t.far_leg_client.value_date.isoformat(),
-                "Rate": fmt_rate(t.far_leg_client.fx_rate, 6),
-                f"{t.base_ccy}": fmt_money(t.far_leg_client.base_flow, 2),
-                f"{t.quote_ccy}": fmt_money(t.far_leg_client.quote_flow, 2),
-            },
-        ]
-        df = pd.DataFrame(rows)
-        st.dataframe(df, hide_index=True, width="stretch")
+def _render_results(t, inputs: dict) -> None:
+    # --- Compact breadcrumb header ---
+    notional_str = (
+        f"{fmt_money(t.near_base_notional, 0).lstrip('+')} / "
+        f"{fmt_money(t.far_base_notional, 0).lstrip('+')} {t.base_ccy}"
+        if t.is_uneven
+        else f"{fmt_money(t.near_base_notional, 0).lstrip('+')} {t.base_ccy}"
+    )
+    st.markdown(
+        f"**{t.pair}** &nbsp;·&nbsp; {inputs['near_side_label']} "
+        f"&nbsp;·&nbsp; {t.days} days &nbsp;·&nbsp; {notional_str} "
+        f"&nbsp;·&nbsp; pip factor {fmt_money(t.pip_factor, 0).lstrip('+')}"
+    )
 
+    spread_pips = (t.forward_client - t.forward_mid) * t.pip_factor
+    fwd_points_client = (t.forward_client - t.spot) * t.pip_factor
+
+    # ======================================================================
+    # 1. QUOTE  — three rates, client highlighted
+    # ======================================================================
+    st.markdown("### 1. Quote")
+    st.markdown(
+        f"""
+| | Rate | vs spot |
+|---|---|---|
+| Spot | `{fmt_rate(t.spot, 6)}` | — |
+| Forward (mid) | `{fmt_rate(t.forward_mid, 6)}` | `{fmt_rate(t.forward_points, 2)}` pips |
+| :{CLIENT_COLOR}[**Forward (client)**] | :{CLIENT_COLOR}[**`{fmt_rate(t.forward_client, 6)}`**] | :{CLIENT_COLOR}[**`{fmt_rate(fwd_points_client, 2)}` pips**] (incl. `{fmt_rate(spread_pips, 2)}` spread) |
+"""
+    )
+
+    # ======================================================================
+    # 2. ROUND-TRIP P&L  — mid vs client, side aware, rate-only annualisation
+    # ======================================================================
+    net_base_mid = t.near_leg.base_flow + t.far_leg_mid.base_flow
+    net_quote_mid = t.near_leg.quote_flow + t.far_leg_mid.quote_flow
+    net_quote_client = t.near_leg.quote_flow + t.far_leg_client.quote_flow
+
+    cf_sign = 1.0 if t.side == "BUY" else -1.0
+    ann_mid = -cf_sign * (t.forward_mid - t.spot) / t.spot * 360.0 / t.days
+    ann_client = -cf_sign * (t.forward_client - t.spot) / t.spot * 360.0 / t.days
+
+    st.markdown("### 2. Round-trip P&L")
+    st.markdown(
+        f"""
+| | Mid (no spread) | :{CLIENT_COLOR}[**Client (with spread)**] | Δ (spread cost) |
+|---|---|---|---|
+| Net {t.quote_ccy} | `{fmt_money(net_quote_mid, 2)}` | :{CLIENT_COLOR}[**`{fmt_money(net_quote_client, 2)}`**] | `{fmt_money(net_quote_client - net_quote_mid, 2)}` |
+| Annualised (rate) | `{fmt_pct(ann_mid)}` | :{CLIENT_COLOR}[**`{fmt_pct(ann_client)}`**] | `{fmt_pct(ann_client - ann_mid)}` |
+
+**Bank revenue**: `{fmt_money(t.spread_cost_quote, 2).lstrip('+')} {t.quote_ccy}` &nbsp;·&nbsp; sign convention: **+ client receives, − client pays**
+"""
+    )
+
+    if abs(net_base_mid) > 1e-9:
         st.caption(
-            "Signs: **+ you receive**, **− you pay**. Near leg is the spot exchange. "
-            "Far leg at mid is the fair forward. Far leg at client rate is what you "
-            "actually quote — the difference is the spread."
+            f"Uneven swap — non-zero net in {t.base_ccy}: "
+            f"`{fmt_money(net_base_mid, 2)}` (same at mid and client; "
+            f"spread is in {t.quote_ccy} only)."
         )
 
-        # ---- Client P&L on the swap (round-trip) ----
-        # Sum of both legs per ccy. For a matched swap the base ccy nets to
-        # zero by construction and the P&L lives in the quote ccy; for an
-        # uneven swap both can be non-zero. Spread is always on the quote
-        # far leg, so the base-ccy delta vs mid is always zero.
-        net_base_mid = t.near_leg.base_flow + t.far_leg_mid.base_flow
-        net_quote_mid = t.near_leg.quote_flow + t.far_leg_mid.quote_flow
-        net_base_client = t.near_leg.base_flow + t.far_leg_client.base_flow
-        net_quote_client = t.near_leg.quote_flow + t.far_leg_client.quote_flow
+    # ======================================================================
+    # 3. CASHFLOWS  — table, client row highlighted
+    # ======================================================================
+    st.markdown("### 3. Cashflows")
+    rows = [
+        {
+            "Leg": "Near (spot)",
+            "Value date": t.near_leg.value_date.isoformat(),
+            "Rate": fmt_rate(t.near_leg.fx_rate, 6),
+            t.base_ccy: fmt_money(t.near_leg.base_flow, 2),
+            t.quote_ccy: fmt_money(t.near_leg.quote_flow, 2),
+        },
+        {
+            "Leg": "Far (mid)",
+            "Value date": t.far_leg_mid.value_date.isoformat(),
+            "Rate": fmt_rate(t.far_leg_mid.fx_rate, 6),
+            t.base_ccy: fmt_money(t.far_leg_mid.base_flow, 2),
+            t.quote_ccy: fmt_money(t.far_leg_mid.quote_flow, 2),
+        },
+        {
+            "Leg": "Far (client)",
+            "Value date": t.far_leg_client.value_date.isoformat(),
+            "Rate": fmt_rate(t.far_leg_client.fx_rate, 6),
+            t.base_ccy: fmt_money(t.far_leg_client.base_flow, 2),
+            t.quote_ccy: fmt_money(t.far_leg_client.quote_flow, 2),
+        },
+    ]
+    df = pd.DataFrame(rows)
 
-        # Rate-based annualised round-trip P&L. Independent of notionals so
-        # uneven swaps don't smear an outright trade into the carry number.
-        # Sign convention matches the cashflow round-trip for a matched swap:
-        #   side=BUY  (client sells base near, buys back far): P&L = +N·(S − F)
-        #   side=SELL (client buys base near, sells back far): P&L = −N·(S − F)
-        # Annualise by /S × 360/days. cf_sign flips for SELL.
-        cf_sign = 1.0 if t.side == "BUY" else -1.0
-        ann_mid = -cf_sign * (t.forward_mid - t.spot) / t.spot * 360.0 / t.days
-        ann_client = -cf_sign * (t.forward_client - t.spot) / t.spot * 360.0 / t.days
+    def _highlight_client(row):
+        if row["Leg"] == "Far (client)":
+            return ["background-color: rgba(255, 165, 0, 0.18); font-weight: 600"] * len(row)
+        return [""] * len(row)
 
-        st.subheader("Client P&L on the swap (round-trip)")
-        st.caption(
-            f"Sum of both legs per ccy. Ignores anything the client does with "
-            f"the {t.base_ccy} between the legs — pure FX round-trip."
-        )
-        c1, c2 = st.columns(2)
-        c1.metric(
-            f"Net {t.quote_ccy} before spread",
-            fmt_money(net_quote_mid, 2),
-            help=f"Far {t.quote_ccy} + Near {t.quote_ccy} at the mid forward. "
-                 f"Fair-value round-trip P&L (no spread applied).",
-        )
-        c1.metric(
-            f"Net {t.quote_ccy} after spread",
-            fmt_money(net_quote_client, 2),
-            delta=fmt_money(net_quote_client - net_quote_mid, 2),
-            delta_color="inverse",
-            help=f"What the client actually pockets in {t.quote_ccy} once the "
-                 f"spread is applied. Delta = spread cost (= bank revenue with opposite sign).",
-        )
-        c2.metric(
-            "Annualised round-trip rate (before spread)",
-            fmt_pct(ann_mid),
-            help="−sign(side) · (F_mid − S) / S · 360/days. "
-                 "Side-aware; positive = client earns, negative = client pays. "
-                 "Notional-independent — works the same for matched and uneven swaps.",
-        )
-        c2.metric(
-            "Annualised round-trip rate (after spread)",
-            fmt_pct(ann_client),
-            delta=fmt_pct(ann_client - ann_mid),
-            delta_color="inverse",
-            help="Same formula with F_client (spread applied). "
-                 "Delta = annualised spread cost = −(pct/100) · 360/days.",
-        )
+    st.dataframe(
+        df.style.apply(_highlight_client, axis=1),
+        hide_index=True,
+        use_container_width=True,
+    )
+    st.caption("Sign convention: **+ client receives, − client pays**.")
 
-        if abs(net_base_mid) > 1e-9:
-            st.caption(
-                f"Uneven swap — non-zero net in {t.base_ccy}: "
-                f"`{fmt_money(net_base_mid, 2)}` (same at mid and client; "
-                f"spread is in {t.quote_ccy} only)."
-            )
+    # ======================================================================
+    # Details (collapsed)
+    # ======================================================================
+    with st.expander("Formulas and details"):
+        pip_factor_str = fmt_money(t.pip_factor, 0).lstrip("+")
+        mode_label = "uneven swap" if t.is_uneven else "matched swap"
+        spread_sign = "+" if t.side == "BUY" else "−"
+        st.markdown(
+            f"""
+**Pair**: {t.pair} &nbsp; (base = {t.base_ccy}, quote = {t.quote_ccy}, pip factor = {pip_factor_str}, mode = {mode_label})
 
-        # ---- Spread P&L in quote ccy ----
-        st.subheader("Spread (quote ccy)")
-        c1, c2 = st.columns(2)
-        c1.metric(
-            f"Bank revenue ({t.quote_ccy})",
-            fmt_money(t.spread_cost_quote, 2).lstrip("+"),
-            help="Difference between far-leg quote-ccy amount at client rate vs mid. "
-                 "This is what the client pays extra (or receives less) compared to mid.",
-        )
-        c2.metric(
-            "Spread (rate)",
-            fmt_rate(t.spread_rate, 6),
-            help="Derived from spot * (%) / 100. F_client = F_mid ± spread.",
+**Spread input**: `{inputs['spread_value']:.4f} {inputs['spread_unit']}` → `spread_rate = {fmt_rate(t.spread_rate, 6)}` ({spread_pips:+.2f} pips)
+
+**F_mid** = `S + P/pip = {fmt_rate(t.spot, 6)} + {fmt_rate(t.forward_points, 4)} / {pip_factor_str} = {fmt_rate(t.forward_mid, 6)}`
+
+**F_client** = `F_mid {spread_sign} spread = {fmt_rate(t.forward_client, 6)}`
+
+**Rates applied**: near = `{fmt_rate(t.near_leg.fx_rate, 6)}`, far mid = `{fmt_rate(t.far_leg_mid.fx_rate, 6)}`, far client = `{fmt_rate(t.far_leg_client.fx_rate, 6)}`
+
+**Implied IR differential** (market property, side-independent): `(F_mid − S) / S × 360/days = {fmt_pct(t.market_swap_rate)}` ≈ `r_{t.quote_ccy.lower()} − r_{t.base_ccy.lower()}`
+
+**Annualised P&L formula** (side-aware, notional-independent): `−sign(side) · (F − S) / S × 360/days`. Spread cost annualised = `−(spread_rate / S) × 360/days`.
+
+**Notionals**: near = `{fmt_money(t.near_base_notional, 2).lstrip('+')} {t.base_ccy}`, far = `{fmt_money(t.far_base_notional, 2).lstrip('+')} {t.base_ccy}`
+            """
         )
 
-        # ---- Footer: informational rate ----
-        with st.expander("Implied IR differential and formulas"):
-            pip_factor_str = fmt_money(t.pip_factor, 0).lstrip("+")
-            mode_label = "uneven swap" if t.is_uneven else "matched swap"
-            st.markdown(
-                f"""
-    **Pair**: {t.pair}  (base = {t.base_ccy}, quote = {t.quote_ccy}, pip factor = {pip_factor_str}, mode = {mode_label})
 
-    **Market forward mid**: `S + P/pip = {fmt_rate(t.spot, 6)} + {fmt_rate(t.forward_points, 4)} / {pip_factor_str} = {fmt_rate(t.forward_mid, 6)}`
+def render_quote_tab() -> None:
+    inputs = _render_inputs()
+    if not inputs:
+        st.info("Fill in the trade in the left panel and click **Quote**.")
+        return
 
-    **Market forward client** (spread {('+ ' if t.side == 'BUY' else '− ')}{t.spread_rate:.6f}): `F_mid {('+' if t.side == 'BUY' else '−')} spread = {fmt_rate(t.forward_client, 6)}`
+    try:
+        t = compute_ticket(
+            pair=inputs["pair_obj"],
+            side=inputs["side"],
+            near_date=inputs["near_date"],
+            far_date=inputs["far_date"],
+            spot=inputs["spot"],
+            forward_points=inputs["forward_points"],
+            spread_rate=inputs["spread_rate"],
+            near_amount=inputs["near_amount"],
+            near_amount_ccy=inputs["near_amount_ccy"],
+            far_amount=inputs["far_amount"],
+            far_amount_ccy=inputs["far_amount_ccy"],
+        )
+    except (ValueError, KeyError) as e:
+        st.error(str(e))
+        return
 
-    **Rates applied per leg**:
-    - Near: `{fmt_rate(t.near_leg.fx_rate, 6)}` (= spot)
-    - Far mid: `{fmt_rate(t.far_leg_mid.fx_rate, 6)}` (= forward mid)
-    - Far client: `{fmt_rate(t.far_leg_client.fx_rate, 6)}` (= forward client)
+    _render_results(t, inputs)
 
-    **IR differential** (market swap rate, sign-symmetric):
-    `(F_mid − S) / S × 360/days = {fmt_pct(t.market_swap_rate)}` — interpretable as `r_{t.quote_ccy.lower()} − r_{t.base_ccy.lower()}`. This is a market property, not side-dependent.
 
-    **Carry to your side** (shown above) = `±` IR differential, sign chosen so positive means you earn carry on the ccy you hold over the period. Spread cost is always subtracted.
-
-    **Near base notional**: `{fmt_money(t.near_base_notional, 2).lstrip('+')} {t.base_ccy}`
-    **Far  base notional**: `{fmt_money(t.far_base_notional, 2).lstrip('+')} {t.base_ccy}` ({mode_label})
-                """
-            )
-
+st.title("FX Swap Quoting Ticket")
+st.caption(
+    "ACT/360 · cashflows from the client's perspective · spread always against the client on the far leg"
+)
 
 tab_quote, tab_cheat = st.tabs(["Quote", "Cheat sheet"])
 
